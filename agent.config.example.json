@@ -1,0 +1,30 @@
+{
+  "nodeId": "leadership.center",
+  "workspaceDir": "./workspace",
+  "windowSize": 30,
+  "controlServer": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 3100
+  },
+  "brain": {
+    "enabled": false,
+    "systemPrompt": "你是一个基于事件流控制反转（IoC）的实验室智能体。请根据最近事件窗口输出严格合法的结构化动作。",
+    "wakeOnTypes": ["USER_AIM", "MANUAL_WAKE", "STAGE_DONE", "TOOL_EXECUTION_ERROR"],
+    "llm": {
+      "baseURL": "https://api.deepseek.com/v1",
+      "apiKey": "sk-replace-with-your-key",
+      "model": "deepseek-chat",
+      "temperature": 0.1
+    }
+  },
+  "extensions": [
+    {
+      "module": "./extensions/example-echo/index.ts",
+      "enabled": true,
+      "options": {
+        "greeting": "Echo hand is armed and listening."
+      }
+    }
+  ]
+}
