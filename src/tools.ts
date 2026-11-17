@@ -23,8 +23,13 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
       description: "读取 workspace 工作区内的文件",
       parameters: z.object({ path: z.string() }),
       execute: async ({ path }) => {
-        const content = await readFile(resolveSafePath(bus.workspaceDir, path), "utf-8");
-        return { path, content };
+        try {
+          const content = await readFile(resolveSafePath(bus.workspaceDir, path), "utf-8");
+          return { ok: true, path, content };
+        } catch (err: any) {
+          // 事件/工具级报错：零静默返回完整错误给 LLM，不杀进程
+          return { ok: false, path, error: err.message ?? String(err) };
+        }
       },
     }),
 
@@ -32,10 +37,14 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
       description: "写入或更新 workspace 工作区内的文件（如 DIARY.md, OrderForm, REPORT.md）",
       parameters: z.object({ path: z.string(), content: z.string() }),
       execute: async ({ path, content }) => {
-        const full = resolveSafePath(bus.workspaceDir, path);
-        await mkdir(dirname(full), { recursive: true });
-        await writeFile(full, content, "utf-8");
-        return { ok: true, path, bytes: Buffer.byteLength(content) };
+        try {
+          const full = resolveSafePath(bus.workspaceDir, path);
+          await mkdir(dirname(full), { recursive: true });
+          await writeFile(full, content, "utf-8");
+          return { ok: true, path, bytes: Buffer.byteLength(content) };
+        } catch (err: any) {
+          return { ok: false, path, error: err.message ?? String(err) };
+        }
       },
     }),
 
@@ -43,35 +52,43 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
       description: "列出 workspace 指定目录内容",
       parameters: z.object({ path: z.string().default(".") }),
       execute: async ({ path }) => {
-        const entries = await readdir(resolveSafePath(bus.workspaceDir, path), { withFileTypes: true });
-        return entries.map((e) => ({ name: e.name, type: e.isDirectory() ? "dir" : "file" }));
+        try {
+          const entries = await readdir(resolveSafePath(bus.workspaceDir, path), { withFileTypes: true });
+          return {
+            ok: true,
+            entries: entries.map((e) => ({ name: e.name, type: e.isDirectory() ? "dir" : "file" })),
+          };
+        } catch (err: any) {
+          return { ok: false, path, error: err.message ?? String(err) };
+        }
       },
     }),
 
     exec_cli: tool({
-      description: "在 workspace 下执行本地 CLI / Python 脚本命令（非 0 退出码将直接触发 Fast-Fail）",
+      description: "在 workspace 下执行本地 CLI / Python 脚本命令",
       parameters: z.object({
         command: z.string(),
         timeoutMs: z.number().default(30_000),
       }),
       execute: async ({ command, timeoutMs }) => {
         try {
-          const { stdout, stderr } = await execAsync(command, {
-            cwd: bus.workspaceDir,
-            timeout: timeoutMs,
-          });
-          return { exitCode: 0, stdout: stdout.trim(), stderr: stderr.trim() };
+          const { stdout, stderr } = await execAsync(command, { cwd: bus.workspaceDir, timeout: timeoutMs });
+          return { ok: true, exitCode: 0, stdout: stdout.trim(), stderr: stderr.trim() };
         } catch (err: any) {
-          // Fast-Fail: 命令执行失败不再静默包装，直接携完整 stdout/stderr 抛出异常中断当前动作
-          throw new Error(
-            `CLI Execution Failed (code=${err.code ?? 1}): ${command}\nSTDOUT: ${(err.stdout ?? "").trim()}\nSTDERR: ${(err.stderr ?? err.message ?? "").trim()}`
-          );
+          // 脚本返回非 0 退出码属于事件/业务报错：完整保留 stdout/stderr 交给女仆发告警事件，绝不直接 exit(1)
+          return {
+            ok: false,
+            exitCode: err.code ?? 1,
+            command,
+            stdout: (err.stdout ?? "").trim(),
+            stderr: (err.stderr ?? err.message ?? "").trim(),
+          };
         }
       },
     }),
 
     emit_event: tool({
-      description: "向事件总线生产并注入一条新事件（通知其他拓展或远端节点）",
+      description: "向事件总线生产并注入一条新事件（含正常 Report 或异常告警事件 !）",
       parameters: z.object({
         type: z.string(),
         target: z.string().default("*"),
@@ -84,10 +101,9 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
         const evt = await bus.ingest({
           ...params,
           source: bus.nodeId,
-          // 自身产出的事件对本机强制不触发递归 Wake
           wake: params.target !== bus.nodeId && params.target !== "*" ? params.wake : false,
         });
-        return { emittedEventId: evt.id };
+        return { ok: true, emittedEventId: evt.id };
       },
     }),
   };
