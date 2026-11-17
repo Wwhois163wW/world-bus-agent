@@ -2,6 +2,7 @@ import { appendFile, readFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 import { loadConfig } from "c12";
 import { Hono } from "hono";
@@ -16,30 +17,37 @@ import {
   type WorldBusContext,
 } from "./types.js";
 import { createNativeWorkspaceTools } from "./tools.js";
-import { createMaidParticipant } from "./maid.js";
+import { createMaidParticipant, type MaidConsumedPrompt, type MaidTurnResult } from "./maid.js";
 import { dumpCrashReportSync, type CrashReport } from "./crash.js";
 
-export async function bootstrap() {
-  const { config } = await loadConfig({
-    name: "agent",
-    defaults: {
-      nodeId: process.env.AGENT_NODE_ID || "leadership.center",
-      workspaceDir: "./workspace",
-      port: Number(process.env.AGENT_PORT || 3100),
-      windowSize: 40,
-      tickIntervalMs: 0,
-      llm: {
-        enabled: Boolean(process.env.LLM_API_KEY),
-        baseURL: process.env.LLM_BASE_URL || "https://api.deepseek.com/v1",
-        apiKey: process.env.LLM_API_KEY || "",
-        model: process.env.LLM_MODEL || "deepseek-chat",
-        systemPrompt: "你是工作区内的自律智能体女仆，通过消费事件流并调用工具完成任务。",
-        maxSteps: 8,
-      },
-      extensions: [] as Array<{ module: string; options?: Record<string, unknown> }>,
-    },
-  });
+export interface RuntimeConfig {
+  nodeId: string;
+  workspaceDir: string;
+  port: number;
+  windowSize: number;
+  tickIntervalMs: number;
+  llm: {
+    enabled: boolean;
+    baseURL: string;
+    apiKey: string;
+    model: string;
+    systemPrompt: string;
+    maxSteps: number;
+  };
+  extensions: Array<{ module: string; options?: Record<string, unknown> }>;
+}
 
+export interface RuntimeOverrides {
+  /** 测试专用：替换真实 LLM 网络请求 */
+  maidExecute?: (input: MaidConsumedPrompt, bus: WorldBusContext) => Promise<MaidTurnResult>;
+  /** 测试专用：拦截 process.exit(1) 以便断言底层崩溃 */
+  onExit?: (code: number) => never | void;
+}
+
+export async function createAgentRuntime(
+  config: RuntimeConfig,
+  overrides: RuntimeOverrides = {}
+) {
   const workspaceDir = resolve(config.workspaceDir);
   await mkdir(workspaceDir, { recursive: true });
   const eventsLogPath = join(workspaceDir, "events.jsonl");
@@ -53,8 +61,8 @@ export async function bootstrap() {
   const tools: Record<string, Tool> = {};
   const participants: BusParticipant<any, any>[] = [];
   const crashHandlers: Array<(report: CrashReport) => Promise<void> | void> = [];
+  const exitFn = overrides.onExit ?? ((code: number) => process.exit(code));
 
-  /** 底层报错：旁路落盘 CRASH_LATEST.json -> 尽力触发旁路钩子(1.5s超时) -> Fast-Fail 退出 */
   async function handleFatalCrash(
     stage: CrashReport["stage"],
     error: unknown,
@@ -75,19 +83,11 @@ export async function bootstrap() {
         new Promise((r) => setTimeout(r, 1500)),
       ]);
     }
-    process.exit(1);
+    exitFn(1);
+    throw error instanceof Error ? error : new Error(String(error));
   }
 
-  process.on("uncaughtException", (err) => {
-    dumpCrashReportSync({ nodeId: config.nodeId, workspaceDir, stage: "UNCAUGHT", error: err });
-    process.exit(1);
-  });
-  process.on("unhandledRejection", (reason) => {
-    dumpCrashReportSync({ nodeId: config.nodeId, workspaceDir, stage: "UNCAUGHT", error: reason });
-    process.exit(1);
-  });
-
-  // 1. 启动恢复：恢复 eventsWindow 与未签收的 Stock；若账本损坏则直接底层 Fast-Fail
+  // 1. 启动恢复：从 events.jsonl 恢复 eventsWindow 与未经过 END_TURN 签收的 Stock
   if (existsSync(eventsLogPath)) {
     const lines = (await readFile(eventsLogPath, "utf-8")).trim().split("\n").filter(Boolean);
     const allParsed: BusEvent[] = [];
@@ -127,7 +127,6 @@ export async function bootstrap() {
     });
     if (!parsed.success) {
       const errMsg = `Invalid Event Schema from [${raw.source}]: ${parsed.error.message}`;
-      console.error(`⚠️ [EVENT_REJECTED] ${errMsg}`);
       throw new Error(errMsg);
     }
 
@@ -148,6 +147,9 @@ export async function bootstrap() {
     llm: config.llm,
     getTools: () => tools,
   });
+  if (overrides.maidExecute) {
+    maid.execute = overrides.maidExecute;
+  }
 
   /** generatePrompt -> Busy -> 女仆 -> endTurn -> Stock */
   async function triggerMaidTurn(incomingWake: BusEvent[], reason: string): Promise<void> {
@@ -158,7 +160,7 @@ export async function bootstrap() {
     }
 
     const batch = [...stock.splice(0), ...incomingWake];
-    if (batch.length === 0 || !config.llm.enabled || !config.llm.apiKey) return;
+    if (batch.length === 0 || !config.llm.enabled) return;
 
     busy = true;
     try {
@@ -171,13 +173,12 @@ export async function bootstrap() {
         await recordToLedger(rawEvt);
       }
     } catch (llmErr) {
-      // LLM 算子本身崩溃属于底层故障：直接旁路落盘 CRASH_LATEST.json 并退出（未签收的 batch 下次重启自动从 events.jsonl 恢复）
       await handleFatalCrash("MAID_TURN", llmErr, { triggerReason: reason, pendingBatch: batch });
     } finally {
       busy = false;
     }
 
-    if (stock.length > 0) {
+    if (stock.length > 0 && !crashed) {
       await triggerMaidTurn([], "DRAIN_STOCK_AFTER_END_TURN");
     }
   }
@@ -207,8 +208,6 @@ export async function bootstrap() {
               await bus.ingest(produced);
             }
           } catch (taskErr: any) {
-            // 事件报错：拓展执行任务异常，包装为高优错误事件注入主事件流唤醒女仆处理
-            console.error(`❗ [EVENT_ERROR][${p.id}]`, taskErr);
             if (event.type !== "EXTENSION_TASK_ERROR") {
               await bus.ingest({
                 source: p.id,
@@ -222,7 +221,6 @@ export async function bootstrap() {
                   failedParticipant: p.id,
                   triggerEventId: event.id,
                   error: taskErr?.message ?? String(taskErr),
-                  stack: taskErr?.stack,
                 },
               });
             }
@@ -258,13 +256,18 @@ export async function bootstrap() {
     }
   }
 
-  if (config.tickIntervalMs > 0) {
-    setInterval(() => bus.tick("TIMER_TICK"), config.tickIntervalMs);
-  }
-
   const app = new Hono();
   app.get("/status", (c) =>
-    c.json({ nodeId: config.nodeId, busy, stockCount: stock.length, stock, recentWindow: eventsWindow.slice(-10) })
+    c.json({
+      nodeId: config.nodeId,
+      crashed,
+      busy,
+      stockCount: stock.length,
+      stock,
+      windowCount: eventsWindow.length,
+      recentWindow: eventsWindow.slice(-10),
+      tools: Object.keys(tools),
+    })
   );
   app.post("/events", async (c) => {
     try {
@@ -280,8 +283,57 @@ export async function bootstrap() {
     return c.json({ ok: true, stockRemaining: stock.length });
   });
 
-  serve({ fetch: app.fetch, hostname: "127.0.0.1", port: config.port });
+  return {
+    bus,
+    app,
+    tools,
+    getState: () => ({
+      busy,
+      crashed,
+      stock: [...stock],
+      eventsWindow: [...eventsWindow],
+    }),
+  };
+}
+
+export async function bootstrap() {
+  const { config } = await loadConfig<RuntimeConfig>({
+    name: "agent",
+    defaults: {
+      nodeId: process.env.AGENT_NODE_ID || "leadership.center",
+      workspaceDir: "./workspace",
+      port: Number(process.env.AGENT_PORT || 3100),
+      windowSize: 40,
+      tickIntervalMs: 0,
+      llm: {
+        enabled: Boolean(process.env.LLM_API_KEY),
+        baseURL: process.env.LLM_BASE_URL || "https://api.deepseek.com/v1",
+        apiKey: process.env.LLM_API_KEY || "",
+        model: process.env.LLM_MODEL || "deepseek-chat",
+        systemPrompt: "你是工作区内的自律智能体女仆，通过消费事件流并调用工具完成任务。",
+        maxSteps: 8,
+      },
+      extensions: [],
+    },
+  });
+
+  process.on("uncaughtException", (err) => {
+    dumpCrashReportSync({ nodeId: config.nodeId, workspaceDir: config.workspaceDir, stage: "UNCAUGHT", error: err });
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    dumpCrashReportSync({ nodeId: config.nodeId, workspaceDir: config.workspaceDir, stage: "UNCAUGHT", error: reason });
+    process.exit(1);
+  });
+
+  const runtime = await createAgentRuntime(config);
+  if (config.tickIntervalMs > 0) {
+    setInterval(() => runtime.bus.tick("TIMER_TICK"), config.tickIntervalMs);
+  }
+  serve({ fetch: runtime.app.fetch, hostname: "127.0.0.1", port: config.port });
   console.log(`[${config.nodeId}] Ready -> http://127.0.0.1:${config.port}`);
 }
 
-bootstrap();
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  bootstrap();
+}
