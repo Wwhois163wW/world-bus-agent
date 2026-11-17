@@ -1,50 +1,72 @@
 import { z } from "zod";
-import type { Hookable } from "hookable";
 import type { Tool } from "ai";
 
-/**
- * 事件 Schema (由拓展或 LLM 生产，经 Zod 校验后落盘 events.jsonl)
- * - wake: 对应流程图中的菱形 Flag (true 立即走 Wake，false 进 Stock)
- * - responseMode: 事件设计期决定的响应要求 (optional 可选回应 / respond 必须回应 / tool_required 必须调工具)
- */
-export const WorldEventSchema = z.object({
+/** 粉色图左上角 Zod 校验的标准事件信封 */
+export const BusEventSchema = z.object({
   id: z.string(),
   ts: z.string(),
   source: z.string(),
   target: z.string().default("*"),
   type: z.string(),
-  prompt: z.string(), // 事件携带的提示词描述（供 generatePrompt 直接拼装）
+  /** 生产者在设计期包装好的提示词描述（供 LLM 消费阅读） */
+  prompt: z.string(),
+  /** 生产者在设计期写死的菱形 Flag：true 走 Wake 立即唤醒，false 进 Stock 攒批 */
   wake: z.boolean().default(false),
+  /** 事件响应级别约束 */
   responseMode: z.enum(["optional", "respond", "tool_required"]).default("optional"),
+  /** 是否允许跨机桥接拓展外发 */
   outbound: z.boolean().default(true),
+  /** 结构化数据载荷（供确定性拓展消费或记录结算元数据） */
   payload: z.record(z.unknown()).default({}),
 });
 
-export type WorldEvent = z.infer<typeof WorldEventSchema>;
-export type EventInput = z.input<typeof WorldEventSchema>;
+export type BusEvent = z.infer<typeof BusEventSchema>;
+export type RawBusEventInput = Omit<z.input<typeof BusEventSchema>, "id" | "ts">;
 
-export interface AgentHooks {
-  "agent:ready": (ctx: AgentContext) => Promise<void> | void;
-  "bus:event": (event: WorldEvent, meta: { fromBridge?: boolean }) => Promise<void> | void;
-  "agent:stop": () => Promise<void> | void;
+/**
+ * 任意拓展（以及 Agent LLM 自身）插入事件总线时必须实现的【纯总线收发契约】
+ * 约束：consume 与 produce 必须是纯转换动作，严禁包含任何外部 I/O 副作用！
+ */
+export interface BusParticipant<TConsumedInput = unknown, TProducedOutput = unknown> {
+  readonly id: string;
+
+  /**
+   * 【消费动作 Consume】（无外部副作用）
+   * 从总线的 eventsWindow 与待办批次中只读投影出本模块需要的输入。
+   * 若当前事件与本模块无关，返回 null。
+   */
+  consume(
+    eventsWindow: ReadonlyArray<BusEvent>,
+    pendingBatch: ReadonlyArray<BusEvent>,
+    extraContext?: { diary?: string; triggerReason?: string }
+  ): TConsumedInput | null;
+
+  /**
+   * 【生产动作 Produce】（无外部副作用）
+   * 将模块内部执行完的结果，纯函数式地打包为标准事件数组，交由总线送入左上角 Event -> Zod 入口。
+   */
+  produce(output: TProducedOutput): RawBusEventInput[];
+
+  /**
+   * 模块内部执行器（外部拓展的业务动作或 LLM 的 ToolLoop 推理在此发生，与纯总线收发解耦）
+   */
+  execute?(input: TConsumedInput, bus: WorldBusContext): Promise<TProducedOutput>;
 }
 
-export interface AgentContext {
+export interface WorldBusContext {
   readonly nodeId: string;
   readonly workspaceDir: string;
-  readonly hooks: Hookable<AgentHooks>;
-  /** 注入事件：走 Event -> Zod -> events.jsonl -> eventsWindow & Flag */
-  emit: (
-    input: Omit<EventInput, "id" | "ts" | "source"> & { source?: string },
-    meta?: { fromBridge?: boolean }
-  ) => Promise<WorldEvent>;
-  /** 触发旁路 Tick 脉冲：直接唤醒消化 Stock */
+  /** 将生产出的原始事件送入左上角 Event -> Zod -> events.jsonl 管道 */
+  ingest: (raw: RawBusEventInput, meta?: { fromBridge?: boolean }) => Promise<BusEvent>;
+  /** 旁路 Tick 脉冲：直接触发 Stock 排空 */
   tick: (reason?: string) => Promise<void>;
-  /** 允许外部拓展追加自定义 Tool（内置原生工具已默认挂载） */
+  /** 注册一个实现好 consume/produce 的总线参与者（拓展） */
+  registerParticipant: (participant: BusParticipant<any, any>) => void;
+  /** 向女仆追加注册原生或自定义工具 */
   registerTool: (name: string, toolDef: Tool) => void;
 }
 
 export type AgentExtension = (
-  ctx: AgentContext,
+  bus: WorldBusContext,
   options?: Record<string, unknown>
 ) => Promise<void> | void;
