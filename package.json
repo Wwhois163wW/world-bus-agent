@@ -2,8 +2,7 @@
   "name": "world-bus-agent",
   "version": "0.1.0",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/main.js",
   "scripts": {
     "dev": "tsx src/main.ts",
     "build": "tsc",
