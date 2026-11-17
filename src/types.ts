@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { Tool } from "ai";
+import type { CrashReport } from "./crash.js";
 
 /** 粉色图左上角 Zod 校验的标准事件信封 */
 export const BusEventSchema = z.object({
@@ -64,6 +65,8 @@ export interface WorldBusContext {
   registerParticipant: (participant: BusParticipant<any, any>) => void;
   /** 向女仆追加注册原生或自定义工具 */
   registerTool: (name: string, toolDef: Tool) => void;
+  /** 可选旁路崩溃钩子：能广播就尽力广播，不走主事件流，超时或失败直接忽略 */
+  onCrash: (handler: (report: CrashReport) => Promise<void> | void) => void;
 }
 
 export type AgentExtension = (
