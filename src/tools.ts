@@ -49,21 +49,23 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
     }),
 
     exec_cli: tool({
-      description: "在 workspace 下执行本地 CLI / Python 脚本命令",
+      description: "在 workspace 下执行本地 CLI / Python 脚本命令（非 0 退出码将直接触发 Fast-Fail）",
       parameters: z.object({
         command: z.string(),
         timeoutMs: z.number().default(30_000),
       }),
       execute: async ({ command, timeoutMs }) => {
         try {
-          const { stdout, stderr } = await execAsync(command, { cwd: bus.workspaceDir, timeout: timeoutMs });
+          const { stdout, stderr } = await execAsync(command, {
+            cwd: bus.workspaceDir,
+            timeout: timeoutMs,
+          });
           return { exitCode: 0, stdout: stdout.trim(), stderr: stderr.trim() };
         } catch (err: any) {
-          return {
-            exitCode: err.code ?? 1,
-            stdout: (err.stdout ?? "").trim(),
-            stderr: (err.stderr ?? err.message ?? "").trim(),
-          };
+          // Fast-Fail: 命令执行失败不再静默包装，直接携完整 stdout/stderr 抛出异常中断当前动作
+          throw new Error(
+            `CLI Execution Failed (code=${err.code ?? 1}): ${command}\nSTDOUT: ${(err.stdout ?? "").trim()}\nSTDERR: ${(err.stderr ?? err.message ?? "").trim()}`
+          );
         }
       },
     }),
