@@ -1,6 +1,6 @@
 import { ToolLoopAgent, stepCountIs, type Tool } from "ai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import type { BusEvent, BusParticipant, RawBusEventInput } from "./types.js";
+import type { BusParticipant, RawBusEventInput } from "./types.js";
 
 export interface MaidConsumedPrompt {
   promptText: string;
@@ -22,10 +22,7 @@ export function createMaidParticipant(config: {
   return {
     id: config.nodeId,
 
-    /**
-     * 【LLM 的纯消费动作 Consume】：对应粉色图中的 generatePrompt 节点
-     * 纯函数组装：DIARY.md + eventsWindow 历史背景 + 本轮 Stock/Wake 待办批次 -> Prompt
-     */
+    /** 纯消费动作 (generatePrompt) */
     consume(eventsWindow, pendingBatch, extra) {
       if (pendingBatch.length === 0) return null;
 
@@ -59,10 +56,7 @@ export function createMaidParticipant(config: {
       };
     },
 
-    /**
-     * 【LLM 的纯生产动作 Produce】：对应粉色图中的 endTurn 结算写回
-     * 将本轮推理文本、已消费事件 ID 列表、工具调用轨迹纯函数打包为 END_TURN 事件
-     */
+    /** 纯生产动作 (封装 endTurn 结算事件) */
     produce(turnResult): RawBusEventInput[] {
       return [
         {
@@ -81,7 +75,6 @@ export function createMaidParticipant(config: {
       ];
     },
 
-    /** 执行 ToolLoopAgent 推理循环 */
     async execute(input) {
       const provider = createOpenAICompatible({
         name: "openai-compatible",
