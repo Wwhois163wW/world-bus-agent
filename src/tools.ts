@@ -27,7 +27,6 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
           const content = await readFile(resolveSafePath(bus.workspaceDir, path), "utf-8");
           return { ok: true, path, content };
         } catch (err: any) {
-          // 事件/工具级报错：零静默返回完整错误给 LLM，不杀进程
           return { ok: false, path, error: err.message ?? String(err) };
         }
       },
@@ -75,7 +74,6 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
           const { stdout, stderr } = await execAsync(command, { cwd: bus.workspaceDir, timeout: timeoutMs });
           return { ok: true, exitCode: 0, stdout: stdout.trim(), stderr: stderr.trim() };
         } catch (err: any) {
-          // 脚本返回非 0 退出码属于事件/业务报错：完整保留 stdout/stderr 交给女仆发告警事件，绝不直接 exit(1)
           return {
             ok: false,
             exitCode: err.code ?? 1,
@@ -88,7 +86,7 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
     }),
 
     emit_event: tool({
-      description: "向事件总线生产并注入一条新事件（含正常 Report 或异常告警事件 !）",
+      description: "向事件总线生产并注入一条新事件（含正常业务事件或异常告警事件）",
       parameters: z.object({
         type: z.string(),
         target: z.string().default("*"),
