@@ -1,4 +1,5 @@
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, readFile, mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createHooks } from "hookable";
@@ -8,46 +9,155 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { ToolLoopAgent, stepCountIs, type Tool } from "ai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { createNativeTools } from "./tools.js";
 import {
   WorldEventSchema,
-  type AgentConfig,
   type AgentContext,
   type AgentExtension,
-  type RuntimeHooks,
+  type AgentHooks,
   type WorldEvent,
 } from "./types.js";
 
-async function main() {
-  // 1. 使用 c12 加载 agent.config.ts / .json 及环境变量覆盖
-  const { config } = await loadConfig<AgentConfig>({
+async function bootstrap() {
+  const { config } = await loadConfig({
     name: "agent",
     defaults: {
-      nodeId: process.env.AGENT_NODE_ID || "node.local",
+      nodeId: process.env.AGENT_NODE_ID || "leadership.center",
       workspaceDir: "./workspace",
       port: Number(process.env.AGENT_PORT || 3100),
-      windowSize: 30,
+      windowSize: 40,
+      tickIntervalMs: 0, // 若 > 0 则启动内置周期 Tick
       llm: {
         enabled: Boolean(process.env.LLM_API_KEY),
         baseURL: process.env.LLM_BASE_URL || "https://api.deepseek.com/v1",
         apiKey: process.env.LLM_API_KEY || "",
         model: process.env.LLM_MODEL || "deepseek-chat",
-        systemPrompt: "You are an event-driven agent core. Analyze the event window and invoke registered tools when needed.",
-        wakeOnTypes: ["MANUAL_WAKE"],
-        maxSteps: 5,
+        systemPrompt: "你是运行在工作区内的自律智能体。请根据 eventsWindow 背景与本轮待办事件处理任务。",
+        maxSteps: 8,
       },
-      extensions: [],
+      extensions: [] as Array<{ module: string; options?: Record<string, unknown> }>,
     },
   });
 
   const workspaceDir = resolve(config.workspaceDir);
   await mkdir(workspaceDir, { recursive: true });
+  const eventsLogPath = join(workspaceDir, "events.jsonl");
 
-  // 2. 初始化 Hookable 总线与内存状态（运行态仅 standby <-> active）
-  const hooks = createHooks<RuntimeHooks>();
+  // === 流程图中的 3 个核心状态容器 ===
+  const eventsWindow: WorldEvent[] = []; // 圆圈: eventsWindow (历史背景窗口)
+  const stock: WorldEvent[] = [];        // 圆圈: Stock (未唤醒/忙碌期积压待办池)
+  let busy = false;                      // 菱形: Busy 互斥锁
+
+  // 启动时从 events.jsonl 尾部恢复 eventsWindow
+  if (existsSync(eventsLogPath)) {
+    const lines = (await readFile(eventsLogPath, "utf-8")).trim().split("\n").filter(Boolean);
+    for (const line of lines.slice(-config.windowSize)) {
+      try {
+        eventsWindow.push(WorldEventSchema.parse(JSON.parse(line)));
+      } catch {}
+    }
+  }
+
+  /** 落盘更新 events.jsonl 并同步更新 eventsWindow (对应: Zod -> update -> events.jsonl -> build -> eventsWindow) */
+  async function recordToLedger(raw: Omit<WorldEvent, "id" | "ts"> & { id?: string; ts?: string }): Promise<WorldEvent> {
+    const event = WorldEventSchema.parse({
+      id: raw.id ?? `EVT-${Date.now()}-${randomUUID().slice(0, 5)}`,
+      ts: raw.ts ?? new Date().toISOString(),
+      ...raw,
+    });
+    await appendFile(eventsLogPath, JSON.stringify(event) + "\n", "utf-8");
+    eventsWindow.push(event);
+    if (eventsWindow.length > config.windowSize) {
+      eventsWindow.shift();
+    }
+    return event;
+  }
+
+  /** 对应流程图中间的 generatePrompt 节点 (组装 eventsWindow 历史背景 + 本轮 Stock/Wake 待办) */
+  function generatePrompt(pendingBatch: WorldEvent[], triggerReason: string) {
+    // 若本轮待办中有任何一个声明了 tool_required，则强制要求调用工具
+    const requiresTool = pendingBatch.some((e) => e.responseMode === "tool_required");
+    const allOptional = pendingBatch.every((e) => e.responseMode === "optional");
+
+    const promptText = [
+      `## 1. 历史上下文窗口 (eventsWindow - 仅供参考，其中 endTurn 之前的事项已结算)`,
+      JSON.stringify(eventsWindow, null, 2),
+      ``,
+      `## 2. 本轮触发原因 (${triggerReason}) 与待办事件批次 (Pending Inbox)`,
+      JSON.stringify(pendingBatch, null, 2),
+      ``,
+      `## 3. 本轮响应约束`,
+      requiresTool
+        ? "- 【强制工具调用】本轮包含 tool_required 事件，你必须调用至少一个工具处理。"
+        : allOptional
+        ? "- 【可选回应】本轮均为 optional 事件，若评估无需动作可直接简短回复结束本轮。"
+        : "- 【必须回应】请针对本轮待办事件执行必要操作并给出明确回应。",
+    ].join("\n");
+
+    return { promptText, requiresTool };
+  }
+
+  /**
+   * 对应流程图右半部闭环: generatePrompt -> Busy -> 女仆(LLM) -> endTurn -> Stock
+   */
+  async function runTurn(incomingWakeEvents: WorldEvent[], reason: string): Promise<void> {
+    // [菱形 Busy]: 如果女仆正忙，新来的唤醒事件直接退入 Stock 排队
+    if (busy) {
+      stock.push(...incomingWakeEvents);
+      return;
+    }
+
+    // 抽空 Stock 中的所有积压事件 + 本次立即唤醒事件
+    const batch = [...stock.splice(0), ...incomingWakeEvents];
+    if (batch.length === 0) return;
+
+    if (!config.llm.enabled || !config.llm.apiKey) return;
+
+    busy = true;
+    try {
+      const { promptText, requiresTool } = generatePrompt(batch, reason);
+
+      const provider = createOpenAICompatible({
+        name: "llm-provider",
+        baseURL: config.llm.baseURL,
+        apiKey: config.llm.apiKey,
+      });
+
+      const maid = new ToolLoopAgent({
+        model: provider(config.llm.model),
+        instructions: config.llm.systemPrompt,
+        tools,
+        toolChoice: requiresTool ? "required" : "auto",
+        stopWhen: stepCountIs(config.llm.maxSteps),
+      });
+
+      const result = await maid.generate({ prompt: promptText });
+
+      // [菱形 endTurn]: 将女仆本轮的响应与 endTurn 结算标记写回 events.jsonl 和 eventsWindow！
+      await recordToLedger({
+        source: config.nodeId,
+        target: config.nodeId,
+        type: "END_TURN",
+        prompt: result.text || "(Turn completed)",
+        wake: false,
+        responseMode: "optional",
+        outbound: false,
+        payload: {
+          processedEventIds: batch.map((e) => e.id),
+          toolCallsCount: result.steps.reduce((acc, s) => acc + (s.toolCalls?.length ?? 0), 0),
+        },
+      });
+    } finally {
+      busy = false;
+      // [endTurn -> Stock -> generatePrompt]: 若忙碌期间 Stock 又进了新事件，立即开启下一轮排空
+      if (stock.length > 0) {
+        await runTurn([], "DRAIN_STOCK_AFTER_END_TURN");
+      }
+    }
+  }
+
+  const hooks = createHooks<AgentHooks>();
   const tools: Record<string, Tool> = {};
-  const slidingWindow: WorldEvent[] = [];
-  const nodePresence = new Map<string, string>();
-  let agentState: "STANDBY" | "ACTIVE" = "STANDBY";
 
   const ctx: AgentContext = {
     nodeId: config.nodeId,
@@ -56,124 +166,81 @@ async function main() {
     registerTool: (name, toolDef) => {
       tools[name] = toolDef;
     },
-    getWindow: () => [...slidingWindow],
-    emit: async (partial, meta = {}) => {
-      const event = WorldEventSchema.parse({
-        id: `EVT-${Date.now()}-${randomUUID().slice(0, 6)}`,
-        ts: new Date().toISOString(),
-        source: partial.source ?? config.nodeId,
-        ...partial,
+    /** 对应流程图左上角入口: Event -> Zod -> update events.jsonl -> build eventsWindow -> Flag */
+    emit: async (input, meta = {}) => {
+      const event = await recordToLedger({
+        source: input.source ?? config.nodeId,
+        target: input.target ?? "*",
+        type: input.type,
+        prompt: input.prompt,
+        wake: input.wake ?? false,
+        responseMode: input.responseMode ?? "optional",
+        outbound: input.outbound ?? true,
+        payload: input.payload ?? {},
       });
 
-      // 本地 workspace 账本持久化
-      await appendFile(join(workspaceDir, "events.jsonl"), JSON.stringify(event) + "\n");
-
-      // SIGNAL（如心跳）仅刷新在线表，不进入 LLM 滑动窗口
-      if (event.category === "SIGNAL") {
-        nodePresence.set(event.source, event.ts);
-      } else {
-        slidingWindow.push(event);
-        if (slidingWindow.length > config.windowSize) slidingWindow.shift();
-      }
-
-      // 广播给所有挂载的拓展（Hand 与桥接器）
+      // 通知挂载的外部拓展 (如 Redis 桥接插件或本地监听插件)
       await hooks.callHook("bus:event", event, meta);
+
+      // 仅当目标包含本节点时，进入菱形 Flag 分流
+      const isForMe = event.target === config.nodeId || event.target === "*";
+      if (isForMe && event.source !== config.nodeId) {
+        if (event.wake) {
+          // Flag --(Wake)--> generatePrompt
+          await runTurn([event], `WAKE_BY_${event.type}`);
+        } else {
+          // Flag --(not Wake)--> Stock
+          stock.push(event);
+        }
+      }
       return event;
+    },
+    /** 对应流程图下方圆圈: Tick -> generatePrompt (不写日志，直接唤醒排空 Stock) */
+    tick: async (reason = "TICK_PULSE") => {
+      await runTurn([], reason);
     },
   };
 
-  // 3. 使用 jiti 动态加载独立拓展仓库
+  // 默认挂载 5 个 CLI 原生工具 (read_file, write_file, list_dir, exec_cli, emit_event)
+  Object.assign(tools, createNativeTools(ctx));
+
+  // 加载外部拓展插件
   const jiti = createJiti(import.meta.url);
-  for (const extEntry of config.extensions) {
-    const mod = await jiti.import<{ default?: AgentExtension; extension?: AgentExtension }>(
-      extEntry.module
-    );
-    const fn = mod.default ?? mod.extension;
-    if (!fn) throw new Error(`拓展模块 [${extEntry.module}] 未导出有效的插件函数`);
-    await fn(ctx, extEntry.options);
+  for (const ext of config.extensions) {
+    const mod = await jiti.import<{ default?: AgentExtension }>(ext.module);
+    if (mod.default) await mod.default(ctx, ext.options);
   }
 
-  // 4. 挂载 LLM 大脑算子（平时 STANDBY 零消耗，命中唤醒条件时瞬时激活调用 Tool）
-  hooks.hook("bus:event", async (event) => {
-    if (!config.llm.enabled || !config.llm.apiKey) return;
-    const isForMe = event.target === config.nodeId || event.target === "*";
-    const shouldWake = event.wake_brain || config.llm.wakeOnTypes.includes(event.type);
-    if (!isForMe || !shouldWake) return;
+  if (config.tickIntervalMs > 0) {
+    setInterval(() => ctx.tick("INTERNAL_TIMER_TICK"), config.tickIntervalMs);
+  }
 
-    agentState = "ACTIVE";
-    try {
-      const provider = createOpenAICompatible({
-        name: "openai-compatible",
-        baseURL: config.llm.baseURL,
-        apiKey: config.llm.apiKey,
-      });
-
-      const brain = new ToolLoopAgent({
-        model: provider(config.llm.model),
-        instructions: config.llm.systemPrompt,
-        tools,
-        stopWhen: stepCountIs(config.llm.maxSteps ?? 5),
-      });
-
-      const causalSlice = event.correlation_id
-        ? slidingWindow.filter((e) => e.correlation_id === event.correlation_id)
-        : slidingWindow.slice(-15);
-
-      await brain.generate({
-        prompt: JSON.stringify({
-          node_id: config.nodeId,
-          online_peers: Object.fromEntries(nodePresence),
-          trigger_event: event,
-          context_window: causalSlice,
-        }),
-      });
-    } finally {
-      agentState = "STANDBY";
-    }
-  });
-
-  // 5. Hono Localhost 控制面（状态查看、外部脚本注入、主动唤醒、热改 LLM 配置）
+  // Localhost 控制端口 (供外部脚本注入 Event、触发 Tick、查看状态)
   const app = new Hono();
-
   app.get("/status", (c) =>
     c.json({
       nodeId: config.nodeId,
-      state: agentState,
-      registeredTools: Object.keys(tools),
-      onlinePeers: Object.fromEntries(nodePresence),
-      windowSize: slidingWindow.length,
-      recentEvents: slidingWindow.slice(-10),
+      busy,
+      stockCount: stock.length,
+      stock,
+      windowCount: eventsWindow.length,
+      recentWindow: eventsWindow.slice(-10),
+      tools: Object.keys(tools),
     })
   );
-
   app.post("/events", async (c) => {
     const body = await c.req.json();
-    const event = await ctx.emit(body);
-    return c.json({ ok: true, event }, 201);
+    const evt = await ctx.emit({ ...body, source: body.source || "external.http" });
+    return c.json({ ok: true, event: evt }, 201);
   });
-
-  app.post("/wake", async (c) => {
-    const body = await c.req.json().catch(() => ({}));
-    const event = await ctx.emit({
-      category: "ACTION",
-      type: body.type || "MANUAL_WAKE",
-      target: body.target || config.nodeId,
-      correlation_id: body.correlation_id ?? null,
-      wake_brain: true,
-      payload: body.payload ?? {},
-    });
-    return c.json({ ok: true, woken: event });
-  });
-
-  app.post("/config/llm", async (c) => {
-    const patch = await c.req.json();
-    Object.assign(config.llm, patch);
-    return c.json({ ok: true, model: config.llm.model, baseURL: config.llm.baseURL, enabled: config.llm.enabled });
+  app.post("/tick", async (c) => {
+    await ctx.tick("HTTP_TICK");
+    return c.json({ ok: true, stockRemaining: stock.length });
   });
 
   await hooks.callHook("agent:ready", ctx);
   serve({ fetch: app.fetch, hostname: "127.0.0.1", port: config.port });
-  console.log(`[${config.nodeId}] Agent Ready (state: ${agentState}) -> http://127.0.0.1:${config.port}`);
+  console.log(`[${config.nodeId}] Ready -> http://127.0.0.1:${config.port}`);
 }
 
-main();
+bootstrap();
