@@ -17,6 +17,7 @@ import {
 } from "./types.js";
 import { createNativeWorkspaceTools } from "./tools.js";
 import { createMaidParticipant } from "./maid.js";
+import { writeCrashReportSync } from "./crash.js";
 
 async function bootstrap() {
   const { config } = await loadConfig({
@@ -27,6 +28,7 @@ async function bootstrap() {
       port: Number(process.env.AGENT_PORT || 3100),
       windowSize: 40,
       tickIntervalMs: 0,
+      exitOnCrash: true, // Fast-Fail 开关：崩溃广播完 CRASH_REPORT 后直接退出进程
       llm: {
         enabled: Boolean(process.env.LLM_API_KEY),
         baseURL: process.env.LLM_BASE_URL || "https://api.deepseek.com/v1",
@@ -42,37 +44,86 @@ async function bootstrap() {
   const workspaceDir = resolve(config.workspaceDir);
   await mkdir(workspaceDir, { recursive: true });
   const eventsLogPath = join(workspaceDir, "events.jsonl");
-  const deadletterPath = join(workspaceDir, "deadletter.jsonl");
   const diaryPath = join(workspaceDir, "DIARY.md");
 
-  // === 粉色图中的核心状态容器 ===
   const eventsWindow: BusEvent[] = [];
   const stock: BusEvent[] = [];
   let busy = false;
+  let crashed = false;
 
   const tools: Record<string, Tool> = {};
   const participants: BusParticipant<any, any>[] = [];
 
-  // 启动恢复：从 events.jsonl 恢复 eventsWindow，并将未经过 END_TURN 签收的遗留事件恢复进 Stock
+  /** 广播崩溃报告给外部拓展（如 Redis 桥接器），随后立即 Fast-Fail */
+  async function handleFatalCrash(
+    stage: "BOOT" | "INGEST_ZOD" | "MAID_TURN" | "PARTICIPANT_EXEC" | "UNCAUGHT",
+    error: unknown,
+    triggerBatch?: ReadonlyArray<BusEvent>,
+    extra?: Record<string, unknown>
+  ): Promise<never> {
+    crashed = true;
+    const crashEvt = writeCrashReportSync({
+      nodeId: config.nodeId,
+      workspaceDir,
+      stage,
+      error,
+      triggerBatch,
+      extra,
+    });
+
+    // 尽力通知已挂载的通信桥接拓展（如 ext-bridge-redis），将 CRASH_REPORT 发往上游
+    for (const p of participants) {
+      try {
+        const input = p.consume(eventsWindow, [crashEvt]);
+        if (input !== null && p.execute) await p.execute(input, bus);
+      } catch (bridgeErr) {
+        console.error(`[Crash Broadcast Failed -> ${p.id}]`, bridgeErr);
+      }
+    }
+
+    if (config.exitOnCrash) {
+      process.exit(1);
+    }
+    throw error instanceof Error ? error : new Error(String(error));
+  }
+
+  // 全局未捕获异常兜底：零静默，直接写 CRASH_REPORT 并退出
+  process.on("uncaughtException", (err) => {
+    writeCrashReportSync({ nodeId: config.nodeId, workspaceDir, stage: "UNCAUGHT", error: err });
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    writeCrashReportSync({ nodeId: config.nodeId, workspaceDir, stage: "UNCAUGHT", error: reason });
+    process.exit(1);
+  });
+
+  // 1. 启动恢复：任何一行 events.jsonl 损坏立即 Fast-Fail，绝不静默跳过！
   if (existsSync(eventsLogPath)) {
     const lines = (await readFile(eventsLogPath, "utf-8")).trim().split("\n").filter(Boolean);
     const allParsed: BusEvent[] = [];
     const settledIds = new Set<string>();
 
-    for (const line of lines) {
+    for (let idx = 0; idx < lines.length; idx++) {
       try {
-        const evt = BusEventSchema.parse(JSON.parse(line));
+        const evt = BusEventSchema.parse(JSON.parse(lines[idx]));
         allParsed.push(evt);
         if (evt.type === "END_TURN" && Array.isArray(evt.payload.processedEventIds)) {
           for (const id of evt.payload.processedEventIds) settledIds.add(String(id));
         }
-      } catch {}
+      } catch (err) {
+        await handleFatalCrash("BOOT", err, [], {
+          reason: `events.jsonl 第 ${idx + 1} 行数据损坏或 Schema 不匹配`,
+          corruptedLine: lines[idx],
+        });
+      }
     }
 
     eventsWindow.push(...allParsed.slice(-config.windowSize));
     for (const evt of allParsed) {
       const isExternalForMe =
-        evt.source !== config.nodeId && (evt.target === config.nodeId || evt.target === "*");
+        evt.source !== config.nodeId &&
+        (evt.target === config.nodeId || evt.target === "*") &&
+        evt.type !== "CRASH_REPORT";
       if (isExternalForMe && !settledIds.has(evt.id)) {
         stock.push(evt);
       }
@@ -88,12 +139,8 @@ async function bootstrap() {
     });
 
     if (!parsed.success) {
-      // 异常分流 1：Zod 格式校验失败写入 deadletter.jsonl，不污染总线
-      await appendFile(
-        deadletterPath,
-        JSON.stringify({ ts: new Date().toISOString(), raw, error: parsed.error.flatten() }) + "\n"
-      );
-      throw new Error(`Event Zod 校验失败: ${parsed.error.message}`);
+      // Zod 校验不过直接生成 CRASH_REPORT 并 Fast-Fail 抛错
+      await handleFatalCrash("INGEST_ZOD", parsed.error, [], { invalidRawInput: raw });
     }
 
     const event = parsed.data;
@@ -103,16 +150,15 @@ async function bootstrap() {
     return event;
   }
 
-  // 实例化女仆参与者 (Maid BusParticipant)
   const maid = createMaidParticipant({
     nodeId: config.nodeId,
     llm: config.llm,
     getTools: () => tools,
   });
 
-  /** 右半部闭环：generatePrompt (maid.consume) -> Busy -> 女仆执行 -> endTurn (maid.produce) -> Stock */
+  /** 右半部闭环：generatePrompt -> Busy -> 女仆 -> endTurn -> Stock */
   async function triggerMaidTurn(incomingWake: BusEvent[], reason: string): Promise<void> {
-    // [菱形 Busy]：若女仆正忙，新来的唤醒事件直接退入 Stock 排队
+    if (crashed) throw new Error(`[${config.nodeId}] Node is in CRASHED state.`);
     if (busy) {
       stock.push(...incomingWake);
       return;
@@ -124,29 +170,21 @@ async function bootstrap() {
     busy = true;
     try {
       const diary = existsSync(diaryPath) ? await readFile(diaryPath, "utf-8") : undefined;
-
-      // 1. 女仆执行纯消费动作 (consume = generatePrompt)
       const consumedPrompt = maid.consume(eventsWindow, batch, { diary, triggerReason: reason });
       if (!consumedPrompt || !maid.execute) return;
 
-      // 2. 女仆执行推理与工具调用循环
       const turnResult = await maid.execute(consumedPrompt, bus);
 
-      // 3. 女仆执行纯生产动作 (produce = 生成 END_TURN 结算事件) 并写回 events.jsonl
-      const endTurnEvents = maid.produce(turnResult);
-      for (const rawEvt of endTurnEvents) {
+      for (const rawEvt of maid.produce(turnResult)) {
         await recordToLedger(rawEvt);
       }
     } catch (err) {
-      // 异常分流 2：LLM API 超时或崩溃时，将本轮未完成的 batch 退回 Stock 队首，绝不吞事件
-      stock.unshift(...batch);
-      console.error(`[${config.nodeId}] 女仆推理异常，已将 ${batch.length} 条事件退回 Stock:`, err);
-      return;
+      // 女仆推理或工具执行崩溃：不静默塞回 Stock，直接产出 CRASH_REPORT 广播并 Fast-Fail！
+      await handleFatalCrash("MAID_TURN", err, batch, { triggerReason: reason });
     } finally {
       busy = false;
     }
 
-    // [endTurn -> Stock]：若忙碌期间 Stock 又积攒了新事件，立即开启下一轮排空
     if (stock.length > 0) {
       await triggerMaidTurn([], "DRAIN_STOCK_AFTER_END_TURN");
     }
@@ -162,22 +200,25 @@ async function bootstrap() {
       participants.push(p);
     },
     ingest: async (raw) => {
+      if (crashed) throw new Error(`[${config.nodeId}] Node is CRASHED, rejecting ingest.`);
       const event = await recordToLedger(raw);
 
-      // 触发其他挂载在总线上的拓展参与者 (consume -> execute -> produce)
       for (const p of participants) {
-        const input = p.consume(eventsWindow, [event]);
-        if (input !== null && p.execute) {
-          const out = await p.execute(input, bus);
-          for (const produced of p.produce(out)) {
-            await bus.ingest(produced);
+        try {
+          const input = p.consume(eventsWindow, [event]);
+          if (input !== null && p.execute) {
+            const out = await p.execute(input, bus);
+            for (const produced of p.produce(out)) {
+              await bus.ingest(produced);
+            }
           }
+        } catch (err) {
+          await handleFatalCrash("PARTICIPANT_EXEC", err, [event], { participantId: p.id });
         }
       }
 
-      // 菱形 Flag 分流：外部发往本节点的事件，按 event.wake 决定走 Wake 还是进 Stock
       const isForMe = event.target === config.nodeId || event.target === "*";
-      if (isForMe && event.source !== config.nodeId) {
+      if (isForMe && event.source !== config.nodeId && event.type !== "CRASH_REPORT") {
         if (event.wake) {
           await triggerMaidTurn([event], `WAKE_BY_${event.type}`);
         } else {
@@ -196,7 +237,10 @@ async function bootstrap() {
   const jiti = createJiti(import.meta.url);
   for (const ext of config.extensions) {
     const mod = await jiti.import<{ default?: AgentExtension }>(ext.module);
-    if (mod.default) await mod.default(bus, ext.options);
+    if (!mod.default) {
+      await handleFatalCrash("BOOT", new Error(`Extension [${ext.module}] missing default export`));
+    }
+    await mod.default(bus, ext.options);
   }
 
   if (config.tickIntervalMs > 0) {
@@ -205,7 +249,7 @@ async function bootstrap() {
 
   const app = new Hono();
   app.get("/status", (c) =>
-    c.json({ nodeId: config.nodeId, busy, stockCount: stock.length, stock, recentWindow: eventsWindow.slice(-10) })
+    c.json({ nodeId: config.nodeId, crashed, busy, stockCount: stock.length, stock, recentWindow: eventsWindow.slice(-10) })
   );
   app.post("/events", async (c) => {
     const body = await c.req.json();
