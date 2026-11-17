@@ -197,26 +197,70 @@ async function handleFatalCrash(
     registerParticipant: (p) => {
       participants.push(p);
     },
-    ingest: async (raw) => {
+ingest: async (raw) => {
       if (crashed) throw new Error(`[${config.nodeId}] Node is CRASHED, rejecting ingest.`);
-      const event = await recordToLedger(raw);
 
+      // 1. Zod 校验：如果外部或拓展传入的事件格式本身不合法，直接抛错拒绝（不进账本，也不杀进程）
+      const parsed = BusEventSchema.safeParse({
+        id: `EVT-${Date.now()}-${randomUUID().slice(0, 5)}`,
+        ts: new Date().toISOString(),
+        ...raw,
+      });
+      if (!parsed.success) {
+        const errMsg = `Invalid Event Schema from [${raw.source}]: ${parsed.error.message}`;
+        console.error(`⚠️ [EVENT_REJECTED] ${errMsg}`);
+        throw new Error(errMsg);
+      }
+
+      // 2. 账本写入：如果连本地磁盘 events.jsonl 都写不进去，属于【底层报错】，直接 Fast-Fail！
+      const event = parsed.data;
+      try {
+        await appendFile(eventsLogPath, JSON.stringify(event) + "\n", "utf-8");
+      } catch (ioErr) {
+        await handleFatalCrash("BOOT", ioErr, { reason: "Failed to append to events.jsonl", event });
+      }
+
+      eventsWindow.push(event);
+      if (eventsWindow.length > config.windowSize) eventsWindow.shift();
+
+      // 3. 拓展参与者消费与执行
       for (const p of participants) {
-        try {
-          const input = p.consume(eventsWindow, [event]);
-          if (input !== null && p.execute) {
+        const input = p.consume(eventsWindow, [event]);
+        if (input !== null && p.execute) {
+          try {
             const out = await p.execute(input, bus);
             for (const produced of p.produce(out)) {
               await bus.ingest(produced);
             }
+          } catch (taskErr: any) {
+            // 【事件报错】：拓展执行具体业务失败（非底层引擎崩溃）
+            // 零静默打印日志，并将其包装为高优错误事件注入主事件流 (wake: true)，唤醒女仆处理或上报！
+            console.error(`❗ [EVENT_ERROR][${p.id}] 拓展执行失败，已转化为错误事件注入总线:`, taskErr);
+            if (event.type !== "EXTENSION_TASK_ERROR") {
+              await bus.ingest({
+                source: p.id,
+                target: config.nodeId,
+                type: "EXTENSION_TASK_ERROR",
+                prompt: `[拓展任务报错] 拓展 "${p.id}" 在处理事件 "${event.type}" (${event.id}) 时异常: ${taskErr?.message ?? String(taskErr)}`,
+                wake: true,
+                responseMode: "respond",
+                outbound: true,
+                payload: {
+                  failedParticipant: p.id,
+                  triggerEventId: event.id,
+                  triggerEventType: event.type,
+                  error: taskErr?.message ?? String(taskErr),
+                  stack: taskErr?.stack,
+                },
+              });
+            }
           }
-        } catch (err) {
-          await handleFatalCrash("PARTICIPANT_EXEC", err, [event], { participantId: p.id });
         }
       }
 
+      // 4. 菱形 Flag 分流：走 Wake 或进 Stock
       const isForMe = event.target === config.nodeId || event.target === "*";
-      if (isForMe && event.source !== config.nodeId && event.type !== "CRASH_REPORT") {
+      if (isForMe && event.source !== config.nodeId) {
         if (event.wake) {
           await triggerMaidTurn([event], `WAKE_BY_${event.type}`);
         } else {
