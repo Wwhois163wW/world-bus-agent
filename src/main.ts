@@ -55,35 +55,33 @@ async function bootstrap() {
   const participants: BusParticipant<any, any>[] = [];
 
   /** 广播崩溃报告给外部拓展（如 Redis 桥接器），随后立即 Fast-Fail */
-  async function handleFatalCrash(
-    stage: "BOOT" | "INGEST_ZOD" | "MAID_TURN" | "PARTICIPANT_EXEC" | "UNCAUGHT",
+async function handleFatalCrash(
+    stage: CrashReport["stage"],
     error: unknown,
-    triggerBatch?: ReadonlyArray<BusEvent>,
-    extra?: Record<string, unknown>
+    contextSnapshot?: unknown
   ): Promise<never> {
     crashed = true;
-    const crashEvt = writeCrashReportSync({
+
+    // 1. 独立旁路落盘，绝不污染 events.jsonl
+    const report = dumpCrashReportSync({
       nodeId: config.nodeId,
       workspaceDir,
       stage,
       error,
-      triggerBatch,
-      extra,
+      contextSnapshot,
     });
 
-    // 尽力通知已挂载的通信桥接拓展（如 ext-bridge-redis），将 CRASH_REPORT 发往上游
-    for (const p of participants) {
-      try {
-        const input = p.consume(eventsWindow, [crashEvt]);
-        if (input !== null && p.execute) await p.execute(input, bus);
-      } catch (bridgeErr) {
-        console.error(`[Crash Broadcast Failed -> ${p.id}]`, bridgeErr);
-      }
+    // 2. 能广播的话看情况：给旁路 crashHandlers 最多 1.5 秒尽力外发，超时/报错直接放行
+    if (crashHandlers.length > 0) {
+      await Promise.race([
+        Promise.allSettled(crashHandlers.map((fn) => Promise.resolve().then(() => fn(report)))),
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]);
     }
 
-    if (config.exitOnCrash) {
-      process.exit(1);
-    }
+    // 3. 干脆利落 Fast-Fail 退出
+    process.exit(1);
+  }
     throw error instanceof Error ? error : new Error(String(error));
   }
 
