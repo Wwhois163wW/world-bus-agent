@@ -1,90 +1,73 @@
-/** 纯粹的本地事件认知分类，与外部传输协议无关 */
-export type EventKind = "OBSERVATION" | "ACTION" | "HEARTBEAT";
+import { z } from "zod";
+import type { Hookable } from "hookable";
+import type { Tool } from "ai";
 
-/** 传输无关的统一世界总线事件信封 */
-export interface WorldEvent<TPayload = Record<string, unknown>> {
-  envelope_version: "1.0";
-  msg_id: string;
-  kind: EventKind;
-  msg_type: string;
-  timestamp: string;
-  source_node: string;
-  target_node: string;
-  order_id?: string | null;
-  correlation_id?: string | null;
-  /** 是否允许通信桥接插件外发至外部总线，默认 true */
-  outbound?: boolean;
-  /** 若为 true（或 kind === "HEARTBEAT"），仅触发状态更新而不挤占 LLM 滑动窗口 */
-  ephemeral?: boolean;
-  /** 显式请求唤醒 LLM 大脑 */
-  wake_brain?: boolean;
-  payload: TPayload;
+/**
+ * 传输无关、业务无关的世界总线事件原语
+ * - OBSERVATION: 眼/手产生的客观事实（进入滑动窗口）
+ * - ACTION: LLM 或人类发出的执行指令（进入滑动窗口）
+ * - SIGNAL: 心跳或定时器脉冲（仅刷新在线状态，不污染 LLM 滑动窗口）
+ */
+export const WorldEventSchema = z.object({
+  id: z.string(),
+  ts: z.string(),
+  category: z.enum(["OBSERVATION", "ACTION", "SIGNAL"]),
+  type: z.string(),
+  source: z.string(),
+  target: z.string().default("*"),
+  correlation_id: z.string().nullable().optional(),
+  causation_id: z.string().nullable().optional(),
+  outbound: z.boolean().default(true),
+  wake_brain: z.boolean().default(false),
+  payload: z.record(z.unknown()).default({}),
+});
+
+export type WorldEvent = z.infer<typeof WorldEventSchema>;
+export type EmitInput = z.input<typeof WorldEventSchema>;
+
+export interface RuntimeHooks {
+  "agent:ready": (ctx: AgentContext) => Promise<void> | void;
+  "bus:event": (event: WorldEvent, meta: { fromBridge?: boolean }) => Promise<void> | void;
+  "agent:stop": () => Promise<void> | void;
 }
 
-export interface EmitOptions {
-  /** 标记事件是否来自外部桥接插件，防止出站桥接器重复转发造成回环 */
-  fromExternalBridge?: boolean;
-}
-
-export interface ExtensionContext {
+export interface AgentContext {
   readonly nodeId: string;
   readonly workspaceDir: string;
+  readonly hooks: Hookable<RuntimeHooks>;
+  /** 注入事件至本地总线（自动追加写入 workspace/events.jsonl 并触发钩子） */
   emit: (
-    event: Omit<WorldEvent, "envelope_version" | "msg_id" | "timestamp" | "source_node">,
-    options?: EmitOptions
+    event: Omit<EmitInput, "id" | "ts" | "source"> & { source?: string },
+    meta?: { fromBridge?: boolean }
   ) => Promise<WorldEvent>;
-  onRawEvent: (listener: (event: WorldEvent, meta: Required<EmitOptions>) => void) => () => void;
-  getRecentWindow: () => ReadonlyArray<WorldEvent>;
-  getNodePresence: () => ReadonlyMap<string, WorldEvent>;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string, meta?: unknown) => void;
+  /** 外部拓展向 LLM 大脑注册可调用的 Vercel AI SDK Tool */
+  registerTool: (name: string, toolDef: Tool) => void;
+  /** 读取当前滑动窗口 */
+  getWindow: () => ReadonlyArray<WorldEvent>;
 }
 
-export interface LlmCallableActionSpec {
-  actionType: string;
-  defaultTargetNode: string;
-  description: string;
-  payloadJsonSchema: Record<string, unknown>;
-}
+/** 所有独立拓展仓库统一遵循的插件函数签名 */
+export type AgentExtension = (
+  ctx: AgentContext,
+  options?: Record<string, unknown>
+) => Promise<void> | void;
 
-export interface AgentExtension {
-  readonly name: string;
-  readonly version?: string;
-  readonly subscriptions?: string[];
-  readonly llmActionSpecs?: LlmCallableActionSpec[];
-  onInit?(ctx: ExtensionContext): Promise<void>;
-  onEvent?(event: WorldEvent, ctx: ExtensionContext): Promise<void>;
-  onDestroy?(): Promise<void>;
-}
-
-export type ExtensionFactory = (
-  options: Record<string, unknown>
-) => AgentExtension | Promise<AgentExtension>;
-
-export interface BrainConfig {
-  enabled: boolean;
-  systemPrompt: string;
-  wakeOnTypes: string[];
+export interface AgentConfig {
+  nodeId: string;
+  workspaceDir: string;
+  port: number;
+  windowSize: number;
   llm: {
+    enabled: boolean;
     baseURL: string;
     apiKey: string;
     model: string;
-    temperature?: number;
+    systemPrompt: string;
+    wakeOnTypes: string[];
+    maxSteps?: number;
   };
-}
-
-export interface AgentCoreConfig {
-  nodeId: string;
-  workspaceDir: string;
-  windowSize?: number;
-  controlServer?: {
-    enabled: boolean;
-    host?: string;
-    port?: number;
-  };
-  brain: BrainConfig;
-  extensions?: Array<{
+  extensions: Array<{
     module: string;
-    enabled?: boolean;
     options?: Record<string, unknown>;
   }>;
 }
