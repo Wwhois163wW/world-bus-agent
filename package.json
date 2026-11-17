@@ -1,30 +1,27 @@
 {
   "name": "world-bus-agent",
   "version": "0.1.0",
-  "description": "Local-first, event-stream IoC agent runtime core with pluggable eyes, hands, and OpenAI-compatible brain.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    }
-  },
   "scripts": {
+    "dev": "tsx src/main.ts",
     "build": "tsc",
-    "dev": "tsx src/cli.ts --config ./agent.config.json",
-    "start": "node dist/cli.js --config ./agent.config.json",
-    "typecheck": "tsc --noEmit"
+    "start": "node dist/main.js"
   },
   "dependencies": {
-    "ajv": "^8.17.1",
-    "ajv-formats": "^3.0.1",
-    "openai": "^4.73.0"
+    "@ai-sdk/openai-compatible": "^1.0.0",
+    "@hono/node-server": "^1.14.0",
+    "ai": "^6.0.0",
+    "c12": "^3.0.0",
+    "hono": "^4.7.0",
+    "hookable": "^5.5.3",
+    "jiti": "^2.4.2",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
-    "@types/node": "^22.9.0",
+    "@types/node": "^22.10.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.7.0"
   }
 }
