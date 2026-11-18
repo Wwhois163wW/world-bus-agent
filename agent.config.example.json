@@ -1,30 +1,17 @@
 {
   "nodeId": "leadership.center",
   "workspaceDir": "./workspace",
+  "port": 3100,
   "windowSize": 30,
-  "controlServer": {
-    "enabled": true,
-    "host": "127.0.0.1",
-    "port": 3100
-  },
-  "brain": {
+  "tickIntervalMs": 0,
+  "llm": {
     "enabled": false,
+    "provider": "openai-compatible",
+    "baseURL": "https://api.openai.com/v1",
+    "apiKey": "sk-replace-with-your-key",
+    "model": "gpt-4o-mini",
     "systemPrompt": "你是一个基于事件流控制反转（IoC）的实验室智能体。请根据最近事件窗口输出严格合法的结构化动作。",
-    "wakeOnTypes": ["USER_AIM", "MANUAL_WAKE", "STAGE_DONE", "TOOL_EXECUTION_ERROR"],
-    "llm": {
-      "baseURL": "https://api.deepseek.com/v1",
-      "apiKey": "sk-replace-with-your-key",
-      "model": "deepseek-chat",
-      "temperature": 0.1
-    }
+    "maxSteps": 8
   },
-  "extensions": [
-    {
-      "module": "./extensions/example-echo/index.ts",
-      "enabled": true,
-      "options": {
-        "greeting": "Echo hand is armed and listening."
-      }
-    }
-  ]
+  "extensions": []
 }

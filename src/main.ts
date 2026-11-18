@@ -19,6 +19,8 @@ import {
 import { createNativeWorkspaceTools } from "./tools.js";
 import { createMaidParticipant, type MaidConsumedPrompt, type MaidTurnResult } from "./maid.js";
 import { dumpCrashReportSync, type CrashReport } from "./crash.js";
+// @Antigravity, 20261118, [FEAT]: 引入提供商预设与连通性测试模块
+import { PROVIDER_PRESETS, testLlmConnection, type LlmConfig } from "./providers.js";
 
 export interface RuntimeConfig {
   nodeId: string;
@@ -26,14 +28,16 @@ export interface RuntimeConfig {
   port: number;
   windowSize: number;
   tickIntervalMs: number;
-  llm: {
-    enabled: boolean;
-    baseURL: string;
-    apiKey: string;
-    model: string;
-    systemPrompt: string;
-    maxSteps: number;
-  };
+  // @Antigravity, 20261118, [REFACTOR]: 使用泛用 LlmConfig（支持 provider 模板自动填充）
+  // llm: {
+  //   enabled: boolean;
+  //   baseURL: string;
+  //   apiKey: string;
+  //   model: string;
+  //   systemPrompt: string;
+  //   maxSteps: number;
+  // };
+  llm: LlmConfig;
   extensions: Array<{ module: string; options?: Record<string, unknown> }>;
 }
 
@@ -282,6 +286,23 @@ export async function createAgentRuntime(
     await bus.tick("HTTP_TICK");
     return c.json({ ok: true, stockRemaining: stock.length });
   });
+  // @Antigravity, 20261118, [FEAT]: 增加模型提供商预设列表与连通性测试接口
+  app.get("/llm/providers", (c) =>
+    c.json({
+      ok: true,
+      providers: Object.values(PROVIDER_PRESETS),
+    })
+  );
+  app.post("/llm/test", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const result = await testLlmConnection({
+      provider: body.provider ?? config.llm.provider,
+      baseURL: body.baseURL ?? config.llm.baseURL,
+      apiKey: body.apiKey ?? config.llm.apiKey,
+      model: body.model ?? config.llm.model,
+    });
+    return c.json(result, result.ok ? 200 : 400);
+  });
 
   return {
     bus,
@@ -307,9 +328,14 @@ export async function bootstrap() {
       tickIntervalMs: 0,
       llm: {
         enabled: Boolean(process.env.LLM_API_KEY),
-        baseURL: process.env.LLM_BASE_URL || "https://api.deepseek.com/v1",
+        // @Antigravity, 20261118, [REFACTOR]: 支持 LLM_PROVIDER 并由提供商预设自动填充默认 baseURL 与 model
+        // baseURL: process.env.LLM_BASE_URL || "https://api.deepseek.com/v1",
+        // apiKey: process.env.LLM_API_KEY || "",
+        // model: process.env.LLM_MODEL || "deepseek-chat",
+        provider: process.env.LLM_PROVIDER || "",
+        baseURL: process.env.LLM_BASE_URL || "",
         apiKey: process.env.LLM_API_KEY || "",
-        model: process.env.LLM_MODEL || "deepseek-chat",
+        model: process.env.LLM_MODEL || "",
         systemPrompt: "你是工作区内的自律智能体女仆，通过消费事件流并调用工具完成任务。",
         maxSteps: 8,
       },

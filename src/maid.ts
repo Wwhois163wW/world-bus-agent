@@ -1,5 +1,10 @@
-import { ToolLoopAgent, stepCountIs, type Tool } from "ai";
-import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+// @Antigravity, 20261118, [REFACTOR]: 统一委派 runLlmTurn 执行多协议工具循环
+// import { ToolLoopAgent, stepCountIs, type Tool } from "ai";
+// // @Antigravity, 20261118, [REFACTOR]: 改用泛用 providers 模块创建模型实例
+// // import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+// import { createLanguageModel, type LlmConfig } from "./providers.js";
+import type { Tool } from "ai";
+import { runLlmTurn, type LlmConfig } from "./providers.js";
 import type { BusParticipant, RawBusEventInput } from "./types.js";
 
 export interface MaidConsumedPrompt {
@@ -16,7 +21,9 @@ export interface MaidTurnResult {
 
 export function createMaidParticipant(config: {
   nodeId: string;
-  llm: { baseURL: string; apiKey: string; model: string; systemPrompt: string; maxSteps: number };
+  // @Antigravity, 20261118, [REFACTOR]: 放宽 llm 配置为泛用 LlmConfig（支持 provider 模板自动填充）
+  // llm: { baseURL: string; apiKey: string; model: string; systemPrompt: string; maxSteps: number };
+  llm: Omit<LlmConfig, "enabled"> & { enabled?: boolean };
   getTools: () => Record<string, Tool>;
 }): BusParticipant<MaidConsumedPrompt, MaidTurnResult> {
   return {
@@ -76,27 +83,49 @@ export function createMaidParticipant(config: {
     },
 
     async execute(input) {
-      const provider = createOpenAICompatible({
-        name: "openai-compatible",
-        baseURL: config.llm.baseURL,
-        apiKey: config.llm.apiKey,
-      });
-
-      const agent = new ToolLoopAgent({
-        model: provider(config.llm.model),
-        instructions: config.llm.systemPrompt,
+      // @Antigravity, 20261118, [REFACTOR]: 改由 runLlmTurn 统一分发 @google/genai Interactions 与 OpenAI-Compatible ToolLoopAgent
+      // // @Antigravity, 20261118, [REFACTOR]: 使用统一提供商工厂创建 LanguageModel（支持 OpenAI 兼容与 Vertex Express）
+      // // const provider = createOpenAICompatible({
+      // //   name: "openai-compatible",
+      // //   baseURL: config.llm.baseURL,
+      // //   apiKey: config.llm.apiKey,
+      // // });
+      // //
+      // // const agent = new ToolLoopAgent({
+      // //   model: provider(config.llm.model),
+      // const { model } = createLanguageModel(config.llm);
+      //
+      // const agent = new ToolLoopAgent({
+      //   model,
+      //   instructions: config.llm.systemPrompt,
+      //   tools: config.getTools(),
+      //   toolChoice: input.requiresTool ? "required" : "auto",
+      //   stopWhen: stepCountIs(config.llm.maxSteps),
+      // });
+      //
+      // const res = await agent.generate({ prompt: input.promptText });
+      // // @Antigravity, 20261118, [FIX]: 对齐 ai@6 TypedToolCall 字段名 (tc.args -> tc.input)
+      // // const toolTrace = res.steps.flatMap((s) =>
+      // //   (s.toolCalls ?? []).map((tc) => ({ toolName: tc.toolName, args: tc.args }))
+      // // );
+      // const toolTrace = res.steps.flatMap((s) =>
+      //   (s.toolCalls ?? []).map((tc) => ({ toolName: tc.toolName, args: tc.input }))
+      // );
+      //
+      // return {
+      //   finalText: res.text,
+      //   consumedEventIds: input.consumedEventIds,
+      //   toolTrace,
+      // };
+      const { finalText, toolTrace } = await runLlmTurn({
+        llm: config.llm,
         tools: config.getTools(),
-        toolChoice: input.requiresTool ? "required" : "auto",
-        stopWhen: stepCountIs(config.llm.maxSteps),
+        promptText: input.promptText,
+        requiresTool: input.requiresTool,
       });
-
-      const res = await agent.generate({ prompt: input.promptText });
-      const toolTrace = res.steps.flatMap((s) =>
-        (s.toolCalls ?? []).map((tc) => ({ toolName: tc.toolName, args: tc.args }))
-      );
 
       return {
-        finalText: res.text,
+        finalText,
         consumedEventIds: input.consumedEventIds,
         toolTrace,
       };

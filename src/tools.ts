@@ -21,7 +21,9 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
   return {
     read_file: tool({
       description: "读取 workspace 工作区内的文件",
-      parameters: z.object({ path: z.string() }),
+      // @Antigravity, 20261118, [FIX]: 对齐 ai@6 tool() 接口 (parameters -> inputSchema)
+      // parameters: z.object({ path: z.string() }),
+      inputSchema: z.object({ path: z.string() }),
       execute: async ({ path }) => {
         try {
           const content = await readFile(resolveSafePath(bus.workspaceDir, path), "utf-8");
@@ -34,7 +36,9 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
 
     write_file: tool({
       description: "写入或更新 workspace 工作区内的文件（如 DIARY.md, OrderForm, REPORT.md）",
-      parameters: z.object({ path: z.string(), content: z.string() }),
+      // @Antigravity, 20261118, [FIX]: 对齐 ai@6 tool() 接口 (parameters -> inputSchema)
+      // parameters: z.object({ path: z.string(), content: z.string() }),
+      inputSchema: z.object({ path: z.string(), content: z.string() }),
       execute: async ({ path, content }) => {
         try {
           const full = resolveSafePath(bus.workspaceDir, path);
@@ -49,7 +53,9 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
 
     list_dir: tool({
       description: "列出 workspace 指定目录内容",
-      parameters: z.object({ path: z.string().default(".") }),
+      // @Antigravity, 20261118, [FIX]: 对齐 ai@6 tool() 接口 (parameters -> inputSchema)
+      // parameters: z.object({ path: z.string().default(".") }),
+      inputSchema: z.object({ path: z.string().default(".") }),
       execute: async ({ path }) => {
         try {
           const entries = await readdir(resolveSafePath(bus.workspaceDir, path), { withFileTypes: true });
@@ -65,7 +71,12 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
 
     exec_cli: tool({
       description: "在 workspace 下执行本地 CLI / Python 脚本命令",
-      parameters: z.object({
+      // @Antigravity, 20261118, [FIX]: 对齐 ai@6 tool() 接口 (parameters -> inputSchema)
+      // parameters: z.object({
+      //   command: z.string(),
+      //   timeoutMs: z.number().default(30_000),
+      // }),
+      inputSchema: z.object({
         command: z.string(),
         timeoutMs: z.number().default(30_000),
       }),
@@ -87,7 +98,16 @@ export function createNativeWorkspaceTools(bus: WorldBusContext): Record<string,
 
     emit_event: tool({
       description: "向事件总线生产并注入一条新事件（含正常业务事件或异常告警事件）",
-      parameters: z.object({
+      // @Antigravity, 20261118, [FIX]: 对齐 ai@6 tool() 接口 (parameters -> inputSchema)
+      // parameters: z.object({
+      //   type: z.string(),
+      //   target: z.string().default("*"),
+      //   prompt: z.string(),
+      //   wake: z.boolean().default(false),
+      //   responseMode: z.enum(["optional", "respond", "tool_required"]).default("optional"),
+      //   payload: z.record(z.unknown()).default({}),
+      // }),
+      inputSchema: z.object({
         type: z.string(),
         target: z.string().default("*"),
         prompt: z.string(),
