@@ -5,3 +5,25 @@ agent.config.json
 .env
 *.log
 .DS_Store
+
+# @Antigravity, 20261118, [FEAT]: 补全 c12 多格式本地配置, 环境变量变体, 运行时落盘与构建临时文件忽略规则
+agent.config.ts
+agent.config.js
+agent.config.mjs
+agent.config.cjs
+agent.config.yaml
+agent.config.yml
+agent.config.local.*
+
+.env.*
+!.env.example
+!.env.example.md
+
+events.jsonl
+DIARY.md
+CRASH_LATEST.json
+crashes/
+
+*.tsbuildinfo
+coverage/
+Thumbs.db

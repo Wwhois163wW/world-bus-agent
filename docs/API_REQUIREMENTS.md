@@ -198,6 +198,7 @@ flowchart TD
   - `app`: `Hono` 实例（可用于 `app.request(...)` 端到端测试）
   - `tools`: 已挂载的工具映射表
   - `getState()`: 返回 `{ busy, crashed, stock, eventsWindow }`
+  - `shutdown()`: 优雅停机句柄, 阻止新回合开启并等待当前 `busy` 回合完成 `END_TURN` 落盘后返回
 
 ### 4.2 `WorldBusContext` 与扩展接口 (`AgentExtension`)
 
@@ -216,9 +217,10 @@ flowchart TD
 
 所有接入总线的参与者（包括女仆本体 `src/maid.ts` 与外部扩展）必须遵守纯函数转换与异步执行分离的设计：
 
+- **`manifest`** *(可选, `ParticipantManifest`)*: 声明扩展的 `description`, `consumes`（监听事件类型与 `payloadSchema`）及 `produces`（产出事件类型）, 供女仆自动识别与通过 `emit_event` 交互。
 - **`consume(eventsWindow, pendingBatch, extraContext?)`**（纯函数, 无外部 I/O）:
   - 当待消费集合为空时返回 `null`。
-  - 女仆实现需求：若存在 `extraContext.diary`（即 `workspace/DIARY.md`）, 需拼入提示词第 0 节（受 `maxDiaryTokens` 限制）；随后对 `pendingBatch` 与 `eventsWindow` 执行单字段掐头留尾截断, 并从最新到最旧对历史窗口按剩余 Token 预算倒序装箱；超水位线（默认 `75%`）或淘汰早期历史时注入 `【上下文水位告警】`；若 `pendingBatch` 中任一事件 `responseMode === "tool_required"`, 必须设置 `requiresTool = true` 并在提示词中注入 `【强制调用工具】` 约束。
+  - 女仆实现需求：若存在 `extraContext.diary`（即 `workspace/DIARY.md`）, 需拼入提示词第 0 节（受 `maxDiaryTokens` 限制）；若存在 `extraContext.extensions`, 需自动渲染为第 `0.5` 节扩展感知目录；随后对 `pendingBatch` 与 `eventsWindow` 执行单字段掐头留尾截断, 并从最新到最旧对历史窗口按剩余 Token 预算倒序装箱；超水位线（默认 `75%`）或淘汰早期历史时注入 `【上下文水位告警】`；若 `pendingBatch` 中任一事件 `responseMode === "tool_required"`, 必须设置 `requiresTool = true` 并在提示词中注入 `【强制调用工具】` 约束。
 - **`execute(input, bus)`**（异步算子）: 执行实际外部交互（LLM 请求, 数据库检查, 硬件调用等）。
 - **`produce(output)`**（纯函数, 无外部 I/O）: 将执行结果打包为待入账的 `RawBusEventInput[]`（女仆实现为生成单条 `END_TURN` 事件）。
 

@@ -29,3 +29,7 @@
   - 新增纯函数 `estimateTokens`, `truncateMiddle`（掐头留尾 45%+45% 截断）与 `sanitizeEventForPrompt`（已结算历史字段限额减半）。
   - `consume` 实行刚性区（`pendingBatch` + `DIARY.md`）与弹性区（`eventsWindow` 倒序装箱）分离, 并在超水位线或发生历史丢弃时自动注入 `DIARY.md` 归档指令。
   - `execute` 与 `produce` 收集并写回 `tokenUsage`（含估算与真实 API Token 账单）至 `END_TURN.payload.tokenUsage`。
+
+### [2026-11-18] @Antigravity, 20261118, [FEAT]: 自动生成已挂载总线扩展感知目录
+- **修改原因**: 让女仆感知当前总线挂载的扩展清单及其 `consumes`/`produces` 契约, 指导 `emit_event` 主动交互与事件溯源。
+- **修改内容**: 新增 `formatExtensionsCatalog`, 在 `consume` 中作为刚性区 C 计入预算并插入 Prompt 第 `0.5` 节。

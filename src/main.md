@@ -26,3 +26,9 @@
 ### [2026-11-18] @Antigravity, 20261118, [FIX]: 修复扩展相对路径解析并支持 enabled 开关
 - **修改原因**: 原 `jiti.import(ext.module)` 基于 `import.meta.url` (`src/main.ts` 或 `dist/main.js`) 解析 `./extensions/...`, 导致无法命中项目根目录下的扩展文件, 且缺少 `enabled: false` 跳过逻辑。
 - **修改内容**: 相对路径通过 `resolve(process.cwd(), ext.module)` 解析后再加载, 并在 `ext.enabled === false` 时跳过加载。
+
+### [2026-11-18] @Antigravity, 20261118, [FEAT]: 透传扩展 Manifest 目录并增加优雅停机保护
+- **修改原因**: 支撑女仆自动感知已挂载扩展, 并保证 `SIGINT`/`SIGTERM` 重启时等待当前 `busy` 回合 `END_TURN` 落盘后再退出。
+- **修改内容**:
+  - `triggerMaidTurn` 向 `maid.consume` 传入 `extensions` 列表。
+  - `createAgentRuntime` 暴露 `shutdown()` 等待 `activeTurnDone`, `bootstrap()` 监听 `SIGINT`/`SIGTERM` 清理定时脉冲与 HTTP 服务后安全退出。

@@ -14,3 +14,7 @@
 ### [2026-11-18] @Antigravity, 20261118, [TEST]: 新增扩展加载与 example-echo 集成测试
 - **修改原因**: 配合 `extensions/example-echo/index.ts` 重写与 `src/main.ts` 相对路径解析修复, 端到端验证扩展生命周期。
 - **修改内容**: 新增 3 个集成测试用例。
+
+### [2026-11-18] @Antigravity, 20261118, [TEST]: 追加扩展 Manifest 注入感知与优雅停机测试
+- **修改原因**: 验证 `ParticipantManifest` 是否自动进入女仆 Prompt, 以及 `runtime.shutdown()` 是否等待进行中的 `busy` 回合完成 `END_TURN` 落盘。
+- **修改内容**: 新增用例 4 与用例 5。

@@ -17,3 +17,7 @@
 ### [2026-11-18] @Antigravity, 20261118, [REFACTOR]: 按新版 AgentExtension + BusParticipant 契约重写
 - **修改原因**: 原代码仍使用已废弃的 `ExtensionFactory` / `LocalWorldEvent` 接口, 无法被 `src/main.ts` 正常加载。
 - **修改内容**: 按非破坏性编辑原则将旧实现完整注释保留, 重写为标准 `AgentExtension` 并新增 `echo_ping` 工具与 `PING_TEST`/`PONG_RESULT` 参与者逻辑。
+
+### [2026-11-18] @Antigravity, 20261118, [FEAT]: 补充 ParticipantManifest 自描述契约与 prefix/target 匹配
+- **修改原因**: 示范扩展如何通过 `manifest` 向女仆暴露自身职责与 `consumes`/`produces` 事件契约。
+- **修改内容**: 增加 `manifest` 字段, 支持 `options.prefix` 前缀格式化与 `target` 精确过滤。

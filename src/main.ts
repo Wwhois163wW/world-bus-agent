@@ -72,6 +72,9 @@ export async function createAgentRuntime(
   const stock: BusEvent[] = [];
   let busy = false;
   let crashed = false;
+  // @Antigravity, 20261118, [FEAT]: 优雅停机标志与当前活跃回合追踪 Promise
+  let shuttingDown = false;
+  let activeTurnDone: Promise<void> | null = null;
 
   const tools: Record<string, Tool> = {};
   const participants: BusParticipant<any, any>[] = [];
@@ -170,8 +173,14 @@ export async function createAgentRuntime(
 
   /** generatePrompt -> Busy -> 女仆 -> endTurn -> Stock */
   async function triggerMaidTurn(incomingWake: BusEvent[], reason: string): Promise<void> {
+    // @Antigravity, 20261118, [FEAT]: 停机或忙碌期间不再开启新回合, 仅压入 Stock 等待后续恢复或续接
+    // if (crashed) return;
+    // if (busy) {
+    //   stock.push(...incomingWake);
+    //   return;
+    // }
     if (crashed) return;
-    if (busy) {
+    if (busy || shuttingDown) {
       stock.push(...incomingWake);
       return;
     }
@@ -180,9 +189,19 @@ export async function createAgentRuntime(
     if (batch.length === 0 || !config.llm.enabled) return;
 
     busy = true;
+    let resolveTurn!: () => void;
+    activeTurnDone = new Promise<void>((r) => {
+      resolveTurn = r;
+    });
     try {
       const diary = existsSync(diaryPath) ? await readFile(diaryPath, "utf-8") : undefined;
-      const consumedPrompt = maid.consume(eventsWindow, batch, { diary, triggerReason: reason });
+      // @Antigravity, 20261118, [FEAT]: 向 maid.consume 注入已挂载扩展感知目录 (Manifests)
+      // const consumedPrompt = maid.consume(eventsWindow, batch, { diary, triggerReason: reason });
+      const consumedPrompt = maid.consume(eventsWindow, batch, {
+        diary,
+        triggerReason: reason,
+        extensions: participants.map((p) => ({ id: p.id, manifest: p.manifest })),
+      });
       if (!consumedPrompt || !maid.execute) return;
 
       const turnResult = await maid.execute(consumedPrompt, bus);
@@ -193,9 +212,11 @@ export async function createAgentRuntime(
       await handleFatalCrash("MAID_TURN", llmErr, { triggerReason: reason, pendingBatch: batch });
     } finally {
       busy = false;
+      activeTurnDone = null;
+      resolveTurn();
     }
 
-    if (stock.length > 0 && !crashed) {
+    if (stock.length > 0 && !crashed && !shuttingDown) {
       await triggerMaidTurn([], "DRAIN_STOCK_AFTER_END_TURN");
     }
   }
@@ -337,6 +358,13 @@ export async function createAgentRuntime(
       stock: [...stock],
       eventsWindow: [...eventsWindow],
     }),
+    // @Antigravity, 20261118, [FEAT]: 暴露优雅停机句柄, 等待当前 busy 回合 END_TURN 落盘后再退出
+    shutdown: async () => {
+      shuttingDown = true;
+      if (activeTurnDone) {
+        await activeTurnDone;
+      }
+    },
   };
 }
 
@@ -376,10 +404,30 @@ export async function bootstrap() {
   });
 
   const runtime = await createAgentRuntime(config);
-  if (config.tickIntervalMs > 0) {
-    setInterval(() => runtime.bus.tick("TIMER_TICK"), config.tickIntervalMs);
-  }
-  serve({ fetch: runtime.app.fetch, hostname: "127.0.0.1", port: config.port });
+  // @Antigravity, 20261118, [FEAT]: 监听 SIGINT / SIGTERM 实现安全优雅停机
+  // if (config.tickIntervalMs > 0) {
+  //   setInterval(() => runtime.bus.tick("TIMER_TICK"), config.tickIntervalMs);
+  // }
+  // serve({ fetch: runtime.app.fetch, hostname: "127.0.0.1", port: config.port });
+  const tickTimer =
+    config.tickIntervalMs > 0
+      ? setInterval(() => runtime.bus.tick("TIMER_TICK"), config.tickIntervalMs)
+      : null;
+  const server = serve({ fetch: runtime.app.fetch, hostname: "127.0.0.1", port: config.port });
+
+  let exiting = false;
+  const gracefulShutdown = async (signal: string) => {
+    if (exiting) return;
+    exiting = true;
+    console.log(`\n[${config.nodeId}] 收到 ${signal}, 等待当前回合结算后安全退出...`);
+    if (tickTimer) clearInterval(tickTimer);
+    await runtime.shutdown();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 2000).unref();
+  };
+  process.on("SIGINT", () => void gracefulShutdown("SIGINT"));
+  process.on("SIGTERM", () => void gracefulShutdown("SIGTERM"));
+
   console.log(`[${config.nodeId}] Ready -> http://127.0.0.1:${config.port}`);
 }
 

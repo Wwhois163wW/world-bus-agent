@@ -55,11 +55,13 @@ import {
 
 interface EchoExecutionResult {
   greeting: string;
+  replyText: string;
   triggerEvent: BusEvent;
 }
 
-const exampleEchoExtension: AgentExtension = (bus, options) => {
-  const greeting = String(options?.greeting ?? "Echo hand is armed and listening.");
+export const exampleEchoExtension: AgentExtension = (bus, options = {}) => {
+  const greeting = String(options.greeting ?? "Echo hand is armed and listening.");
+  const prefix = String(options.prefix ?? "ECHO");
 
   // 1. 向女仆注册扩展工具（遵循 ai@6 inputSchema 规范）
   bus.registerTool(
@@ -78,21 +80,44 @@ const exampleEchoExtension: AgentExtension = (bus, options) => {
     })
   );
 
-  // 2. 注册纯收发分离的 BusParticipant
+  // 2. 注册具备自描述 Manifest 的纯收发分离 BusParticipant
+  // @Antigravity, 20261118, [FEAT]: 补充 ParticipantManifest 自描述契约与 prefix/target 匹配
   bus.registerParticipant({
     id: "ext.example.echo",
+    manifest: {
+      description: "示例回显扩展：接收 PING_TEST 事件并自动向总线回注一条 PONG_RESULT 事件",
+      consumes: [
+        {
+          type: "PING_TEST",
+          description: "触发回显测试",
+          payloadSchema: { message: "string (可选, 要回显的内容)" },
+        },
+      ],
+      produces: [
+        {
+          type: "PONG_RESULT",
+          description: "回显结果事件",
+        },
+      ],
+    },
 
     consume(_eventsWindow, pendingBatch): BusEvent | null {
-      const target = pendingBatch.find((e) => e.type === "PING_TEST");
-      return target ?? null;
+      const hit = pendingBatch.find(
+        (e) =>
+          e.type === "PING_TEST"
+          && (e.target === "ext.example.echo" || e.target === bus.nodeId || e.target === "*")
+      );
+      return hit ?? null;
     },
 
     async execute(event: BusEvent): Promise<EchoExecutionResult> {
       if (event.payload?.simulateError === true) {
         throw new Error("Simulated extension failure on PING_TEST");
       }
+      const msg = String(event.payload.message ?? event.prompt);
       return {
         greeting,
+        replyText: `[${prefix}] ${msg}`,
         triggerEvent: event,
       };
     },
@@ -103,12 +128,13 @@ const exampleEchoExtension: AgentExtension = (bus, options) => {
           source: "ext.example.echo",
           target: result.triggerEvent.source || bus.nodeId,
           type: "PONG_RESULT",
-          prompt: `[example-echo] ${result.greeting} (echoed ${result.triggerEvent.id})`,
+          prompt: `[example-echo] ${result.greeting} -> ${result.replyText} (echoed ${result.triggerEvent.id})`,
           wake: false,
           responseMode: "optional",
           outbound: false,
           payload: {
             echoedFrom: result.triggerEvent.id,
+            reply: result.replyText,
             originalPayload: result.triggerEvent.payload,
           },
         },

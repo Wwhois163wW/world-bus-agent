@@ -19,6 +19,7 @@
 //   toolTrace: Array<{ toolName: string; args: unknown }>;
 // }
 //
+// // @Antigravity, 20261118, [FEAT]: 新增扩展感知目录纯函数格式化器
 // export function createMaidParticipant(config: {
 //   nodeId: string;
 //   llm: Omit<LlmConfig, "enabled"> & { enabled?: boolean };
@@ -88,7 +89,9 @@
 // }
 
 import type { Tool } from "ai";
-import type { BusEvent, BusParticipant, RawBusEventInput } from "./types.js";
+// @Antigravity, 20261118, [FEAT]: 导入 ParticipantManifest 用于拼装已挂载扩展感知目录
+// import type { BusEvent, BusParticipant, RawBusEventInput } from "./types.js";
+import type { BusEvent, BusParticipant, ParticipantManifest, RawBusEventInput } from "./types.js";
 import { runLlmTurn, type LlmRuntimeConfig } from "./providers.js";
 
 export interface ContextBudgetConfig {
@@ -192,6 +195,29 @@ function sanitizeEventForPrompt(
   };
 }
 
+// @Antigravity, 20261118, [FEAT]: 新增扩展感知目录纯函数格式化器
+/**
+ * 将已注册的 BusParticipant 列表格式化为紧凑的 LLM 可读契约目录 (纯函数)
+ */
+function formatExtensionsCatalog(
+  extensions?: ReadonlyArray<{ id: string; manifest?: ParticipantManifest }>
+): string {
+  if (!extensions || extensions.length === 0) return "";
+
+  const catalog = extensions.map((ext) => ({
+    participantId: ext.id,
+    description: ext.manifest?.description ?? "(未提供描述, 仅通过事件流交互)",
+    consumesToTriggerViaEmitEvent: ext.manifest?.consumes ?? [],
+    producesToBus: ext.manifest?.produces ?? [],
+  }));
+
+  return [
+    `## 0.5 已挂载总线扩展目录 (Mounted Extensions - 可通过 emit_event 指定 target/type 交互)`,
+    JSON.stringify(catalog, null, 2),
+    ``,
+  ].join("\n");
+}
+
 export function createMaidParticipant(config: {
   nodeId: string;
   llm: LlmRuntimeConfig;
@@ -233,11 +259,19 @@ export function createMaidParticipant(config: {
         diaryTokens = estimateTokens(diarySection);
       }
 
+      // @Antigravity, 20261118, [FEAT]: 刚性区 C：已挂载扩展感知目录
+      const extensionsSection = formatExtensionsCatalog(extra?.extensions);
+      const extensionsTokens = estimateTokens(extensionsSection);
+
       // 3. 弹性滑动区：计算留给 eventsWindow 的剩余 Token 预算, 从最新往最旧倒序装箱
       const reservedOverheadTokens = 350;
+      // const remainingForHistory = Math.max(
+      //   500,
+      //   maxContextTokens - batchTokens - diaryTokens - reservedOverheadTokens
+      // );
       const remainingForHistory = Math.max(
         500,
-        maxContextTokens - batchTokens - diaryTokens - reservedOverheadTokens
+        maxContextTokens - batchTokens - diaryTokens - extensionsTokens - reservedOverheadTokens
       );
 
       const pendingIds = new Set(pendingBatch.map((e) => e.id));
@@ -260,14 +294,18 @@ export function createMaidParticipant(config: {
       }
 
       const historyJson = JSON.stringify(packedHistory, null, 2);
+      // @Antigravity, 20261118, [FEAT]: 计入 extensionsTokens 并插入扩展感知目录段落
+      // const totalEstimatedTokens =
+      //   diaryTokens + usedHistoryTokens + batchTokens + reservedOverheadTokens;
       const totalEstimatedTokens =
-        diaryTokens + usedHistoryTokens + batchTokens + reservedOverheadTokens;
+        diaryTokens + extensionsTokens + usedHistoryTokens + batchTokens + reservedOverheadTokens;
       const compactionAdvised =
         droppedHistoryEvents > 0 || totalEstimatedTokens >= maxContextTokens * watermarkRatio;
 
       // 4. 组装最终 Prompt
       const sections: string[] = [];
       if (diarySection) sections.push(diarySection);
+      if (extensionsSection) sections.push(extensionsSection);
 
       sections.push(
         `## 1. 历史事件窗口 (eventsWindow - 保留最近 ${packedHistory.length} 条，因预算截断 ${droppedHistoryEvents} 条早期事件)`,

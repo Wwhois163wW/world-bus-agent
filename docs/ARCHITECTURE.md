@@ -134,17 +134,22 @@ sequenceDiagram
 
 ---
 
-## 4. 上下文窗口治理与后续演进
+## 4. 上下文治理, 扩展感知与优雅停机
 
 ### 4.1 女仆内置上下文窗口治理 (`src/maid.ts`)
 
 上下文裁剪与 Token 管理完全内聚于 `Maid` 自身（`consume` 保持 100% 纯函数, 不侵入 `main.ts` 总线调度）：
 1. **单条掐头留尾截断 (`truncateMiddle`)**: 超出 `maxFieldChars`（默认 `1600`）的长文本保留前 `45%` + 后 `45%`, 已结算历史字段限额进一步收紧为 `50%`。
-2. **刚性保底与弹性倒序装箱**: `pendingBatch` 与 `DIARY.md`（上限 `maxDiaryTokens`, 默认 `2000`）优先扣除预算；`eventsWindow` 使用剩余预算从最新向最旧倒序装填, 超出 `maxContextTokens`（默认 `12000`）即淘汰早期记录。
+2. **刚性保底与弹性倒序装箱**: `pendingBatch`, `DIARY.md`（上限 `maxDiaryTokens`, 默认 `2000`）与扩展感知目录优先扣除预算；`eventsWindow` 使用剩余预算从最新向最旧倒序装填, 超出 `maxContextTokens`（默认 `12000`）即淘汰早期记录。
 3. **高水位自动归档提示**: 当历史条目被淘汰或占用率达到 `compactionWatermarkRatio`（默认 `75%`）时, 自动追加 `【上下文水位告警】`, 引导女仆调用 `write_file` 压缩沉淀长期状态至 `DIARY.md`。
 4. **Token 账单回写**: `execute` 汇总估算及真实 API `usage` 后, 由 `produce` 写入 `END_TURN.payload.tokenUsage`。
 
-### 4.2 已知演进方向
+### 4.2 扩展自描述感知 (`ParticipantManifest`) 与优雅停机
+
+1. **扩展自描述目录**: 扩展通过 `BusParticipant.manifest` 声明 `description`, `consumes` 与 `produces` 契约。每次 `triggerMaidTurn` 时, `main.ts` 将所有已注册参与者元数据传入 `maid.consume`, 自动渲染为 Prompt 第 `0.5` 节 `已挂载总线扩展目录`, 使女仆既能看懂来信 `source`, 又能正确调用 `emit_event` 驱动扩展。
+2. **优雅停机保护 (`runtime.shutdown()`)**: `bootstrap()` 监听 `SIGINT` / `SIGTERM`, 停机时清除定时器并调用 `runtime.shutdown()`, 若此时正处于 `busy === true` 回合中, 会等待当前回合完成 `END_TURN` 账本落盘后再关闭 HTTP 服务并退出（后续新事件留在 `events.jsonl`, 重启无损恢复）。
+
+### 4.3 已知演进方向
 
 1. **跨节点总线桥接**: 当前 `outbound` 字段已预留但尚无实际网络/消息队列桥接扩展（如 Redis Stream / HTTP Peer Relay）, 节点间通信目前仅在契约层就位。
-2. **优雅停机与热更新**: 当前尚缺少 `runtime.shutdown()` 清理端口与定时脉冲句柄, 以及运行时配置热更新（`POST /config/llm`）接口。
+2. **运行时配置热更新**: 尚无运行时动态修改模型的 `POST /config/llm` 接口（当前依赖重启挂载新扩展与配置）。

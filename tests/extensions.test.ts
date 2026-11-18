@@ -142,4 +142,99 @@ describe("Extension Loading & example-echo (extensions/example-echo/index.ts)", 
     const crashJson = JSON.parse(await readFile(join(workspaceDir, "CRASH_LATEST.json"), "utf-8"));
     expect(crashJson.stage).toBe("BOOT");
   });
+
+  // @Antigravity, 20261118, [TEST]: 验证扩展 Manifest 自动注入女仆 Prompt 与优雅停机保护
+  it("4. 扩展动态加载与 LLM 感知: 自动通过 jiti 加载 example-echo 并将其 manifest 注入女仆 Prompt", async () => {
+    let capturedPrompt = "";
+    const runtime = await createAgentRuntime(
+      {
+        ...baseConfig,
+        llm: { ...baseConfig.llm, enabled: true },
+        extensions: [
+          {
+            module: "./extensions/example-echo/index.ts",
+            options: { prefix: "NMR_ECHO" },
+          },
+        ],
+      },
+      {
+        maidExecute: async (input) => {
+          capturedPrompt = input.promptText;
+          return {
+            finalText: "I see ext.example.echo",
+            consumedEventIds: input.consumedEventIds,
+            toolTrace: [],
+          };
+        },
+      }
+    );
+
+    await runtime.bus.ingest({
+      source: "user",
+      target: "*",
+      type: "PING_TEST",
+      prompt: "测试扩展回显与感知",
+      wake: true,
+      payload: { message: "hello-bus" },
+    });
+
+    const windowTypes = runtime.getState().eventsWindow.map((e) => e.type);
+    expect(windowTypes).toContain("PONG_RESULT");
+    expect(capturedPrompt).toContain("已挂载总线扩展目录");
+    expect(capturedPrompt).toContain("ext.example.echo");
+    expect(capturedPrompt).toContain("PING_TEST");
+    expect(capturedPrompt).toContain("PONG_RESULT");
+  });
+
+  it("5. 优雅停机保护: runtime.shutdown() 等待当前 busy 回合 END_TURN 落盘后才完成", async () => {
+    let releaseMaid!: () => void;
+    const maidGate = new Promise<void>((r) => {
+      releaseMaid = r;
+    });
+
+    const runtime = await createAgentRuntime(
+      {
+        ...baseConfig,
+        llm: { ...baseConfig.llm, enabled: true },
+        extensions: [],
+      },
+      {
+        maidExecute: async (input) => {
+          await maidGate;
+          return {
+            finalText: "Turn settled safely before shutdown",
+            consumedEventIds: input.consumedEventIds,
+            toolTrace: [],
+          };
+        },
+      }
+    );
+
+    // 启动一个正在进行中的女仆回合 (busy=true)
+    const ingestPromise = runtime.bus.ingest({
+      source: "user",
+      target: "leadership.center",
+      type: "LONG_TASK",
+      prompt: "执行耗时任务",
+      wake: true,
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+    expect(runtime.getState().busy).toBe(true);
+
+    let shutdownCompleted = false;
+    const shutdownPromise = runtime.shutdown().then(() => {
+      shutdownCompleted = true;
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+    expect(shutdownCompleted).toBe(false);
+
+    releaseMaid();
+    await Promise.all([ingestPromise, shutdownPromise]);
+
+    expect(shutdownCompleted).toBe(true);
+    expect(runtime.getState().busy).toBe(false);
+    expect(runtime.getState().eventsWindow.map((e) => e.type)).toEqual(["LONG_TASK", "END_TURN"]);
+  });
 });
