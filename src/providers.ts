@@ -1,3 +1,7 @@
+/**
+ * @file src/providers.ts
+ * @description 泛用 LLM 提供商预设模板解析, 多协议推理调度与连通性测试模块
+ */
 // @Antigravity, 20261118, [REFACTOR]: 卸载 @ai-sdk/google-vertex, 改用官方标准 @google/genai Interactions API
 // import { generateText, type LanguageModel } from "ai";
 // import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
@@ -18,6 +22,15 @@ export interface LlmConfig {
   model?: string;
   systemPrompt: string;
   maxSteps: number;
+}
+
+// @Antigravity, 20261118, [FEAT]: 导出 LlmRuntimeConfig 与 LlmUsage 供 maid.ts 统计 Token 账单
+export type LlmRuntimeConfig = Omit<LlmConfig, "enabled"> & { enabled?: boolean };
+
+export interface LlmUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
 }
 
 export interface ProviderPreset {
@@ -195,12 +208,26 @@ export function createLanguageModel(
 /**
  * 统一执行单轮智能体推理与工具循环（支持 OpenAI-Compatible 与 @google/genai）
  */
+// @Antigravity, 20261118, [FEAT]: 扩展 runLlmTurn 返回 text/finalText 与真实 Token usage 统计
+// export async function runLlmTurn(params: {
+//   llm: Omit<LlmConfig, "enabled"> & { enabled?: boolean };
+//   tools: Record<string, Tool>;
+//   promptText: string;
+//   requiresTool: boolean;
+// }): Promise<{ finalText: string; toolTrace: Array<{ toolName: string; args: unknown }> }> {
 export async function runLlmTurn(params: {
-  llm: Omit<LlmConfig, "enabled"> & { enabled?: boolean };
+  llm: LlmRuntimeConfig;
   tools: Record<string, Tool>;
-  promptText: string;
+  prompt?: string;
+  promptText?: string;
   requiresTool: boolean;
-}): Promise<{ finalText: string; toolTrace: Array<{ toolName: string; args: unknown }> }> {
+}): Promise<{
+  text: string;
+  finalText: string;
+  toolTrace: Array<{ toolName: string; args: unknown }>;
+  usage?: LlmUsage;
+}> {
+  const inputPrompt = params.prompt ?? params.promptText ?? "";
   const resolved = resolveLlmConfig(params.llm);
   if (!resolved.apiKey && resolved.provider !== "ollama") {
     throw new Error(`提供商 "${resolved.provider}" 缺少 apiKey`);
@@ -222,10 +249,29 @@ export async function runLlmTurn(params: {
     );
 
     const toolTrace: Array<{ toolName: string; args: unknown }> = [];
+    let inputTokensSum = 0;
+    let outputTokensSum = 0;
+    let totalTokensSum = 0;
+    let hasUsage = false;
+
+    const accumulateUsage = (usage?: Interactions.Usage) => {
+      if (!usage) return;
+      if (
+        usage.total_input_tokens !== undefined
+        || usage.total_output_tokens !== undefined
+        || usage.total_tokens !== undefined
+      ) {
+        hasUsage = true;
+        inputTokensSum += usage.total_input_tokens ?? 0;
+        outputTokensSum += usage.total_output_tokens ?? 0;
+        totalTokensSum += usage.total_tokens ?? 0;
+      }
+    };
+
     let interaction = await genai.interactions.create({
       model: resolved.model,
       system_instruction: params.llm.systemPrompt,
-      input: params.promptText,
+      input: inputPrompt,
       ...(fnDecls.length > 0 ? { tools: fnDecls } : {}),
       generation_config: {
         ...(fnDecls.length > 0
@@ -233,6 +279,7 @@ export async function runLlmTurn(params: {
           : {}),
       },
     });
+    accumulateUsage(interaction.usage);
 
     const maxSteps = Math.max(1, params.llm.maxSteps || 1);
     for (let stepIdx = 0; stepIdx < maxSteps; stepIdx++) {
@@ -283,11 +330,23 @@ export async function runLlmTurn(params: {
         input: fnResults,
         ...(fnDecls.length > 0 ? { tools: fnDecls } : {}),
       });
+      accumulateUsage(interaction.usage);
     }
 
+    const text = interaction.output_text ?? "";
     return {
-      finalText: interaction.output_text ?? "",
+      text,
+      finalText: text,
       toolTrace,
+      ...(hasUsage
+        ? {
+            usage: {
+              inputTokens: inputTokensSum,
+              outputTokens: outputTokensSum,
+              totalTokens: totalTokensSum,
+            },
+          }
+        : {}),
     };
   }
 
@@ -299,14 +358,20 @@ export async function runLlmTurn(params: {
     toolChoice: params.requiresTool ? "required" : "auto",
     stopWhen: stepCountIs(params.llm.maxSteps),
   });
-  const res = await agent.generate({ prompt: params.promptText });
+  const res = await agent.generate({ prompt: inputPrompt });
   const toolTrace = res.steps.flatMap((s) =>
     (s.toolCalls ?? []).map((tc) => ({ toolName: tc.toolName, args: tc.input }))
   );
 
   return {
+    text: res.text,
     finalText: res.text,
     toolTrace,
+    usage: {
+      inputTokens: res.totalUsage?.inputTokens,
+      outputTokens: res.totalUsage?.outputTokens,
+      totalTokens: res.totalUsage?.totalTokens,
+    },
   };
 }
 
@@ -330,7 +395,9 @@ export async function testLlmConnection(
       const interaction = await genai.interactions.create({
         model: resolved.model,
         input: "Reply with exactly: OK",
-        generation_config: { max_output_tokens: 16 },
+        // @Antigravity, 20261118, [FIX]: 放宽探针 max_output_tokens 至 128, 避免推理模型耗尽输出额度
+        // generation_config: { max_output_tokens: 16 },
+        generation_config: { max_output_tokens: 128 },
       });
       return {
         ok: true,

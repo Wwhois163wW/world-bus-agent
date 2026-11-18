@@ -63,6 +63,7 @@ flowchart TD
 1. **`END_TURN`**: 女仆回合结算事件（`wake: false`, `outbound: false`）, 由 `maid.produce` 生成。
    - `payload.processedEventIds`: `string[]`, 本轮已签收消费的事件 ID 列表, 用于断电重启时去重恢复 `Stock`。
    - `payload.toolTrace`: `Array<{ toolName: string; args: unknown }>`, 本轮实际调用的工具轨迹。
+   - `payload.tokenUsage` *(可选)*: `TokenUsageStats`, 记录估算输入 Token (`estimatedInputTokens`), 淘汰早期历史条数 (`droppedHistoryEvents`) 及真实 API 消耗 (`apiInputTokens`, `apiOutputTokens`, `apiTotalTokens`)。
 2. **`EXTENSION_TASK_ERROR`**: 扩展执行期任务异常事件（`wake: true`, `responseMode: "respond"`, `outbound: true`）。
    - `payload.failedParticipant`: 报错扩展的 `id`。
    - `payload.triggerEventId`: 引发异常的原事件 `id`。
@@ -145,6 +146,33 @@ flowchart TD
   }
   ```
 
+### 3.4 `GET /llm/providers` — 查询内置 LLM 提供商预设列表
+
+- **用途**: 返回支持的模型提供商模板（含 `id`, `protocol`, `defaultBaseURL`, `defaultModel`, `description`, 不包含任何密钥）。
+- **成功响应 (`200 OK`)**:
+  ```json
+  {
+    "ok": true,
+    "providers": [ ... ]
+  }
+  ```
+
+### 3.5 `POST /llm/test` — 执行 LLM 连通性探针测试
+
+- **用途**: 不传参时直接校验当前节点配置；也可传入临时 `{ provider?, baseURL?, apiKey?, model? }` 覆盖字段进行连通性探针测试。
+- **成功响应 (`200 OK`)** / **失败响应 (`400 Bad Request`)**:
+  ```json
+  {
+    "ok": true,
+    "provider": "deepseek",
+    "protocol": "openai-compatible",
+    "model": "deepseek-chat",
+    "baseURL": "https://api.deepseek.com/v1",
+    "latencyMs": 947,
+    "reply": "OK"
+  }
+  ```
+
 ---
 
 ## 4. 运行时与扩展编程接口（Runtime & Extension SDK）
@@ -159,8 +187,9 @@ flowchart TD
   - `port`: HTTP 服务端口
   - `windowSize`: 内存事件窗口大小上限
   - `tickIntervalMs`: 自动脉冲周期（`0` 表示禁用自动定时 Tick）
-  - `llm`: `{ enabled, baseURL, apiKey, model, systemPrompt, maxSteps }`
-  - `extensions`: `Array<{ module: string; options?: Record<string, unknown> }>`
+  - `llm`: `{ enabled, provider?, baseURL?, apiKey, model?, systemPrompt, maxSteps }`（未填 `baseURL` / `model` 时根据 `provider` 或 `apiKey` 前缀自动填充预设）
+  - `budget` *(可选)*: `{ maxContextTokens?, maxDiaryTokens?, maxFieldChars?, compactionWatermarkRatio? }`
+  - `extensions`: `Array<{ module: string; enabled?: boolean; options?: Record<string, unknown> }>`（相对路径基于 `process.cwd()` 解析）
 - **测试/注入钩子 `RuntimeOverrides`**:
   - `maidExecute`: 替换真实 LLM 网络请求, 便于离线单测或自定义执行器
   - `onExit`: 拦截 `process.exit(1)` 以供测试断言 Fast-Fail 退出码
@@ -189,7 +218,7 @@ flowchart TD
 
 - **`consume(eventsWindow, pendingBatch, extraContext?)`**（纯函数, 无外部 I/O）:
   - 当待消费集合为空时返回 `null`。
-  - 女仆实现需求：若存在 `extraContext.diary`（即 `workspace/DIARY.md`）, 需拼入提示词第 0 节；随后拼装 `eventsWindow` 与 `pendingBatch`；若 `pendingBatch` 中任一事件 `responseMode === "tool_required"`, 必须设置 `requiresTool = true` 并在提示词中注入 `【强制调用工具】` 约束（调用 `ToolLoopAgent` 时 `toolChoice = "required"`）。
+  - 女仆实现需求：若存在 `extraContext.diary`（即 `workspace/DIARY.md`）, 需拼入提示词第 0 节（受 `maxDiaryTokens` 限制）；随后对 `pendingBatch` 与 `eventsWindow` 执行单字段掐头留尾截断, 并从最新到最旧对历史窗口按剩余 Token 预算倒序装箱；超水位线（默认 `75%`）或淘汰早期历史时注入 `【上下文水位告警】`；若 `pendingBatch` 中任一事件 `responseMode === "tool_required"`, 必须设置 `requiresTool = true` 并在提示词中注入 `【强制调用工具】` 约束。
 - **`execute(input, bus)`**（异步算子）: 执行实际外部交互（LLM 请求, 数据库检查, 硬件调用等）。
 - **`produce(output)`**（纯函数, 无外部 I/O）: 将执行结果打包为待入账的 `RawBusEventInput[]`（女仆实现为生成单条 `END_TURN` 事件）。
 

@@ -18,3 +18,11 @@
   - 将 `RuntimeConfig.llm` 更新为 `LlmConfig`。
   - 新增 `GET /llm/providers` 与 `POST /llm/test` 控制面接口。
   - 在 `bootstrap()` 中读取 `LLM_PROVIDER`, 并移除写死的 `deepseek` 默认 `baseURL` / `model` 以便由预设模板自动填充。
+
+### [2026-11-18] @Antigravity, 20261118, [FEAT]: RuntimeConfig 支持透传可选 budget 上下文预算配置
+- **修改原因**: 允许运行时通过配置文件自定义 `ContextBudgetConfig`, 由 `maid.ts` 负责消费治理。
+- **修改内容**: 在 `RuntimeConfig` 新增 `budget?: ContextBudgetConfig`, 并在 `createAgentRuntime` 初始化 `createMaidParticipant` 时透传 `budget: config.budget`。
+
+### [2026-11-18] @Antigravity, 20261118, [FIX]: 修复扩展相对路径解析并支持 enabled 开关
+- **修改原因**: 原 `jiti.import(ext.module)` 基于 `import.meta.url` (`src/main.ts` 或 `dist/main.js`) 解析 `./extensions/...`, 导致无法命中项目根目录下的扩展文件, 且缺少 `enabled: false` 跳过逻辑。
+- **修改内容**: 相对路径通过 `resolve(process.cwd(), ext.module)` 解析后再加载, 并在 `ext.enabled === false` 时跳过加载。

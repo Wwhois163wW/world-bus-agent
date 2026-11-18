@@ -134,9 +134,17 @@ sequenceDiagram
 
 ---
 
-## 4. 已知设计留白与后续演进
+## 4. 上下文窗口治理与后续演进
 
-1. **扩展体系适配**: `extensions/example-echo/index.ts` 仍停留在旧版签名, 需按 `AgentExtension` (`(bus, options) => void`) 重写并补充动态加载测试。
-2. **跨节点总线桥接**: 当前 `outbound` 字段已预留但尚无实际网络/消息队列桥接扩展（如 Redis Stream / HTTP Peer Relay）, 节点间通信目前仅在契约层就位。
-3. **上下文窗口治理**: `eventsWindow` 目前仅按条数截断, 尚无 Token 预算估算, 长输出截断或自动归档摘要至 `DIARY.md` 的机制。
-4. **LLM 探针与配置热更新**: `testLlmConnection` 目前 `max_output_tokens` 为 `16`, 对带思维链的推理模型（如 `gemini-4-hydrogen`）可能因思考耗尽额度导致 `reply` 为空字符串；尚无运行时 `POST /config/llm` 热更新接口。
+### 4.1 女仆内置上下文窗口治理 (`src/maid.ts`)
+
+上下文裁剪与 Token 管理完全内聚于 `Maid` 自身（`consume` 保持 100% 纯函数, 不侵入 `main.ts` 总线调度）：
+1. **单条掐头留尾截断 (`truncateMiddle`)**: 超出 `maxFieldChars`（默认 `1600`）的长文本保留前 `45%` + 后 `45%`, 已结算历史字段限额进一步收紧为 `50%`。
+2. **刚性保底与弹性倒序装箱**: `pendingBatch` 与 `DIARY.md`（上限 `maxDiaryTokens`, 默认 `2000`）优先扣除预算；`eventsWindow` 使用剩余预算从最新向最旧倒序装填, 超出 `maxContextTokens`（默认 `12000`）即淘汰早期记录。
+3. **高水位自动归档提示**: 当历史条目被淘汰或占用率达到 `compactionWatermarkRatio`（默认 `75%`）时, 自动追加 `【上下文水位告警】`, 引导女仆调用 `write_file` 压缩沉淀长期状态至 `DIARY.md`。
+4. **Token 账单回写**: `execute` 汇总估算及真实 API `usage` 后, 由 `produce` 写入 `END_TURN.payload.tokenUsage`。
+
+### 4.2 已知演进方向
+
+1. **跨节点总线桥接**: 当前 `outbound` 字段已预留但尚无实际网络/消息队列桥接扩展（如 Redis Stream / HTTP Peer Relay）, 节点间通信目前仅在契约层就位。
+2. **优雅停机与热更新**: 当前尚缺少 `runtime.shutdown()` 清理端口与定时脉冲句柄, 以及运行时配置热更新（`POST /config/llm`）接口。

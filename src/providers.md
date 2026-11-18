@@ -21,3 +21,9 @@
 ### [2026-11-18] @Antigravity, 20261118, [REFACTOR]: 改用官方 @google/genai Interactions API 驱动 Gemini
 - **修改原因**: 卸载 `@ai-sdk/google-vertex`, 统一采用 `@google/genai` 标准 SDK (`ai.interactions.create`) 对接 `AQ.` / `AIza` 密钥及 `gemini-4-hydrogen`。
 - **修改内容**: 新增 `runLlmTurn` 统一封装 `google-genai`（含 `FunctionCallStep` -> `FunctionResultStep` 多步工具循环）与 `openai-compatible`（`ToolLoopAgent`）, 并更新 `testLlmConnection` 与 `PROVIDER_PRESETS.gemini`。
+
+### [2026-11-18] @Antigravity, 20261118, [FEAT]: 返回真实 Token usage 统计并放宽探针输出额度
+- **修改原因**: 支撑 `maid.ts` 在 `END_TURN` 账本中记录精确 `tokenUsage`, 同时解决 `gemini-4-hydrogen` 等推理模型在探针 `max_output_tokens=16` 下可能耗尽额度导致 `reply` 为空的问题。
+- **修改内容**:
+  - 新增导出 `LlmRuntimeConfig` 与 `LlmUsage`, `runLlmTurn` 累计并返回 `usage` (`inputTokens`, `outputTokens`, `totalTokens`) 与 `text`。
+  - `testLlmConnection` 中 `google-genai` 探针 `max_output_tokens` 调整为 `128`。

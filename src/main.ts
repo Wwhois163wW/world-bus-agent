@@ -17,7 +17,14 @@ import {
   type WorldBusContext,
 } from "./types.js";
 import { createNativeWorkspaceTools } from "./tools.js";
-import { createMaidParticipant, type MaidConsumedPrompt, type MaidTurnResult } from "./maid.js";
+// @Antigravity, 20261118, [FEAT]: 支持在 RuntimeConfig 中配置上下文治理预算 ContextBudgetConfig
+// import { createMaidParticipant, type MaidConsumedPrompt, type MaidTurnResult } from "./maid.js";
+import {
+  createMaidParticipant,
+  type ContextBudgetConfig,
+  type MaidConsumedPrompt,
+  type MaidTurnResult,
+} from "./maid.js";
 import { dumpCrashReportSync, type CrashReport } from "./crash.js";
 // @Antigravity, 20261118, [FEAT]: 引入提供商预设与连通性测试模块
 import { PROVIDER_PRESETS, testLlmConnection, type LlmConfig } from "./providers.js";
@@ -38,7 +45,11 @@ export interface RuntimeConfig {
   //   maxSteps: number;
   // };
   llm: LlmConfig;
-  extensions: Array<{ module: string; options?: Record<string, unknown> }>;
+  // @Antigravity, 20261118, [FEAT]: 可选上下文窗口治理与 Token 预算配置
+  budget?: ContextBudgetConfig;
+  // @Antigravity, 20261118, [FEAT]: 扩展配置支持可选 enabled 开关
+  // extensions: Array<{ module: string; options?: Record<string, unknown> }>;
+  extensions: Array<{ module: string; enabled?: boolean; options?: Record<string, unknown> }>;
 }
 
 export interface RuntimeOverrides {
@@ -149,6 +160,8 @@ export async function createAgentRuntime(
   const maid = createMaidParticipant({
     nodeId: config.nodeId,
     llm: config.llm,
+    // @Antigravity, 20261118, [FEAT]: 透传上下文治理预算配置至 Maid
+    budget: config.budget,
     getTools: () => tools,
   });
   if (overrides.maidExecute) {
@@ -251,8 +264,18 @@ export async function createAgentRuntime(
 
   const jiti = createJiti(import.meta.url);
   for (const ext of config.extensions) {
+    // @Antigravity, 20261118, [FIX]: 支持 enabled 开关与基于 process.cwd() 的相对路径扩展加载
+    // try {
+    //   const mod = await jiti.import<{ default?: AgentExtension }>(ext.module);
+    //   if (!mod.default) throw new Error(`Extension [${ext.module}] missing default export`);
+    //   await mod.default(bus, ext.options);
+    // } catch (bootErr) {
+    //   await handleFatalCrash("BOOT", bootErr, { extensionModule: ext.module });
+    // }
+    if (ext.enabled === false) continue;
     try {
-      const mod = await jiti.import<{ default?: AgentExtension }>(ext.module);
+      const moduleSpec = ext.module.startsWith(".") ? resolve(process.cwd(), ext.module) : ext.module;
+      const mod = await jiti.import<{ default?: AgentExtension }>(moduleSpec);
       if (!mod.default) throw new Error(`Extension [${ext.module}] missing default export`);
       await mod.default(bus, ext.options);
     } catch (bootErr) {
