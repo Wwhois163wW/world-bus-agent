@@ -180,13 +180,21 @@ export async function createAgentRuntime(
     //   return;
     // }
     if (crashed) return;
-    if (busy || shuttingDown) {
+    // @Antigravity, 20261119, [FIX]: 仅在 llm.enabled 为 true 时才从 Stock 取出事件, 避免禁用 LLM 时误吞事件
+    // if (busy || shuttingDown) {
+    //   stock.push(...incomingWake);
+    //   return;
+    // }
+    //
+    // const batch = [...stock.splice(0), ...incomingWake];
+    // if (batch.length === 0 || !config.llm.enabled) return;
+    if (busy || shuttingDown || !config.llm.enabled) {
       stock.push(...incomingWake);
       return;
     }
 
     const batch = [...stock.splice(0), ...incomingWake];
-    if (batch.length === 0 || !config.llm.enabled) return;
+    if (batch.length === 0) return;
 
     busy = true;
     let resolveTurn!: () => void;

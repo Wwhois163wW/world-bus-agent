@@ -1,7 +1,7 @@
 # World Bus Agent 开发进度文档
 
-> **更新时间**: 2026-11-18
-> **当前阶段**: 最小可运行核心已跑通（编译, 构建, 离线单测及 DeepSeek / Gemini 双通道真实 E2E 闭环均已验证）
+> **更新时间**: 2026-11-19
+> **当前阶段**: 🎉 **核心版本已封版**（编译, 构建, 全量 6 文件 25 用例离线测试 100% 覆盖, 及 DeepSeek / Gemini 双通道真实 E2E 闭环均已验证）
 
 ---
 
@@ -13,7 +13,7 @@
 | **Phase 1: 根目录配置与旧代码清理** | ✅ 已完成 | 对齐 `agent.config.example.json`, 清理 5 个旧架构残留文件 (`cli.ts`, `ControlServer.ts`, `loader.ts`, `validator.ts`, `WorldBusCore.ts`), 修复 `ai@6` 类型不匹配 |
 | **Phase 2: 泛用模型接入与真实闭环实测** | ✅ 已完成 | 实现 `src/providers.ts`, 集成 `@ai-sdk/openai-compatible@^2.0.94` 与 `@google/genai@^3.5.0`, 完成 DeepSeek 与 Gemini (`AQ.`) 真实工具闭环测试 |
 | **Phase 3: 工作区规则与文档体系** | ✅ 已完成 | 建立根目录优先规则 [GEMINI.md](../GEMINI.md), 补充架构设计文档与开发进度文档 |
-| **Phase 4: 上下文治理, 扩展感知与工程优化** | ✅ 核心完成 | 已完成 `Maid` 上下文治理、`ParticipantManifest` 扩展感知、`example-echo` 示范、`runtime.shutdown()` 优雅停机与 `.gitignore` 加固 |
+| **Phase 4: 上下文治理, 扩展感知与工程封版** | ✅ 已完成 | 完成 `Maid` 上下文治理、`ParticipantManifest` 扩展感知、`example-echo` 示范、`runtime.shutdown()` 优雅停机、HTTP 100% Mock 单测覆盖与 `.gitignore` 加固 |
 
 ---
 
@@ -28,7 +28,7 @@
 | `src/tools.ts` | ✅ 已验证 | `read_file`, `write_file`, `list_dir` 沙箱与越界拦截, `exec_cli` 零静默返回, `emit_event` 防自激铁律 | 待评估是否补充文件编辑 (`edit_file`) 或文件大小限制 |
 | `src/crash.ts` | ✅ 已验证 | 旁路同步写入 `crashes/CRASH-*.json` 与 `CRASH_LATEST.json` | 满足当前需求 |
 | `extensions/example-echo/index.ts` | ✅ 已验证 | 已重写为新版 `AgentExtension`, 附带 `manifest` 自描述契约, 注册 `echo_ping` 工具与 `PING_TEST`/`PONG_RESULT` 参与者 | 满足示例与集成测试需求 |
-| `tests/*.test.ts` | ✅ 6 文件 23 用例全过 | 覆盖 `providers`, `maid` (含上下文治理), `lifecycle`, `error-and-http`, `tools`, `extensions` (含 `Manifest` 感知与 `shutdown`) | 待补充 `POST /llm/test`, `GET /llm/providers` 的 HTTP Mock 单测 |
+| `tests/*.test.ts` | ✅ 6 文件 25 用例全过 | 覆盖 `providers`, `maid` (含上下文治理), `lifecycle`, `error-and-http` (HTTP 5 端点 100% 覆盖), `tools`, `extensions` (含 `Manifest` 感知与 `shutdown`) | 全量核心契约与 HTTP 端点覆盖完成 |
 
 ---
 
@@ -37,11 +37,11 @@
 ### 3.1 编译与离线单元测试（最近一次执行通过）
 - `npm run typecheck` (`tsc --noEmit`): 退出码 0。
 - `npm run build` (`tsc`): 退出码 0。
-- `npm test` (`vitest run`): 6 个测试文件, 23 个测试用例全部通过：
+- `npm test` (`vitest run`): 6 个测试文件, 25 个测试用例全部通过：
   - `tests/providers.test.ts` (3 tests)
   - `tests/maid.test.ts` (4 tests, 含上下文治理 2 项用例)
   - `tests/lifecycle.test.ts` (3 tests)
-  - `tests/error-and-http.test.ts` (4 tests)
+  - `tests/error-and-http.test.ts` (6 tests, 含 `/events`, `/status`, `/tick`, `/llm/providers`, `/llm/test` HTTP Mock 覆盖)
   - `tests/tools.test.ts` (4 tests)
   - `tests/extensions.test.ts` (5 tests, 含扩展 `Manifest` 感知与优雅停机保护)
 
@@ -55,15 +55,10 @@
 
 ---
 
-## 4. 下一步待办清单（Roadmap）
+## 4. 后续可选演进方向（Future Roadmap）
 
-### P0 — 最小核心收尾与缺口补齐
-1. **补全 HTTP 测试用例**: 为 `GET /llm/providers` 与 `POST /llm/test` 增加 Mock 测试用例。
-2. **探针实测回归**: 对 `max_output_tokens: 128` 调整后的 `gemini-4-hydrogen` 探针进行在线验证（确认 `reply` 非空）。
-
-### P1 — 实验运行可用性增强
-1. **本地真实服务启动验证**: 通过 `agent.config.json` 与 `npm run dev` 验证守护进程模式与 `SIGINT`/`SIGTERM` 信号处理稳定性。
-
-### P2 — 参考开源项目优化与多节点扩展
-1. **跨节点桥接扩展**: 基于 `outbound` 事件标志开发独立的节点间通信扩展（如 HTTP Webhook / Redis Stream 桥接）。
-2. **提供商目录与交互优化**: 参考成熟开源项目（如 Vercel AI / LiteLLM / 开源 Agent 框架）的提供商能力声明与错误重试策略, 优化多提供商切换与限流退避处理。
+### 后续演进建议（非封版阻塞项）
+1. **探针在线回归与守护进程实测**: 针对放宽 `max_output_tokens: 128` 后的推理模型探针及 `npm run dev` 守护模式做日常观测。
+2. **运行时配置热更新**: 评估是否补充 `POST /config/llm` 动态切换模型配置。
+3. **跨节点桥接扩展**: 基于 `outbound` 事件标志开发独立的节点间通信扩展（如 HTTP Webhook / Redis Stream 桥接）。
+4. **提供商能力增强**: 参考成熟开源项目补充网络限流重试退避策略。

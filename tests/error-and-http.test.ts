@@ -3,6 +3,9 @@ import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+// @Antigravity, 20261119, [TEST]: 引入 node:http 用于本地 Mock OpenAI 兼容服务器测试 POST /llm/test
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { createAgentRuntime, type RuntimeConfig } from "../src/main.js";
 
 describe("Dual-Layer Error Handling & HTTP Control Surface", () => {
@@ -160,5 +163,127 @@ describe("Dual-Layer Error Handling & HTTP Control Surface", () => {
     const statusBody = await statusRes.json();
     expect(statusBody.stockCount).toBe(1);
     expect(statusBody.windowCount).toBe(1);
+
+    // @Antigravity, 20261119, [TEST]: 补全 POST /tick 与 /llm/providers, /llm/test 100% HTTP 端点覆盖
+    // POST /tick (llm.enabled=false 时触发返回 200 且保留 stockCount)
+    const tickRes = await runtime.app.request("/tick", { method: "POST" });
+    expect(tickRes.status).toBe(200);
+    const tickBody = await tickRes.json();
+    expect(tickBody).toEqual({ ok: true, stockRemaining: 1 });
+  });
+
+  it("5. HTTP GET /llm/providers 返回全部内置模型提供商预设（不含任何密钥）", async () => {
+    const runtime = await createAgentRuntime(
+      { ...baseConfig, llm: { ...baseConfig.llm, enabled: false } },
+      {}
+    );
+
+    const res = await runtime.app.request("/llm/providers");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(Array.isArray(body.providers)).toBe(true);
+
+    const ids = body.providers.map((p: any) => p.id);
+    expect(ids).toEqual(
+      expect.arrayContaining(["gemini", "openai", "deepseek", "openrouter", "ollama", "openai-compatible"])
+    );
+    expect(JSON.stringify(body)).not.toContain("mock-key");
+  });
+
+  it("6. HTTP POST /llm/test Mock 验证：鉴权成功返回 200 + reply，缺 Key 或鉴权失败返回 400", async () => {
+    const mockServer = createServer((req, res) => {
+      if (req.method === "POST" && req.url?.endsWith("/chat/completions")) {
+        if (req.headers.authorization !== "Bearer valid-mock-key") {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "Invalid mock API key" } }));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: "chatcmpl-mock-1",
+            object: "chat.completion",
+            created: 1700000000,
+            model: "mock-model",
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: "OK" },
+                finish_reason: "stop",
+              },
+            ],
+            usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+          })
+        );
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) => mockServer.listen(0, "127.0.0.1", resolve));
+    const port = (mockServer.address() as AddressInfo).port;
+    const mockBaseURL = `http://127.0.0.1:${port}/v1`;
+
+    try {
+      const runtime = await createAgentRuntime(
+        {
+          ...baseConfig,
+          llm: { ...baseConfig.llm, enabled: false, apiKey: "" },
+        },
+        {}
+      );
+
+      // 6a. 缺少 apiKey -> 400
+      const noKeyRes = await runtime.app.request("/llm/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: "openai-compatible", baseURL: mockBaseURL }),
+      });
+      expect(noKeyRes.status).toBe(400);
+      const noKeyBody = await noKeyRes.json();
+      expect(noKeyBody.ok).toBe(false);
+      expect(noKeyBody.error).toContain("缺少 apiKey");
+
+      // 6b. 鉴权失败 (401 from upstream) -> 400
+      const badKeyRes = await runtime.app.request("/llm/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: "openai-compatible",
+          baseURL: mockBaseURL,
+          apiKey: "wrong-key",
+          model: "mock-model",
+        }),
+      });
+      expect(badKeyRes.status).toBe(400);
+      const badKeyBody = await badKeyRes.json();
+      expect(badKeyBody.ok).toBe(false);
+
+      // 6c. 正常连通 -> 200 + reply="OK"
+      const okRes = await runtime.app.request("/llm/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: "openai-compatible",
+          baseURL: mockBaseURL,
+          apiKey: "valid-mock-key",
+          model: "mock-model",
+        }),
+      });
+      expect(okRes.status).toBe(200);
+      const okBody = await okRes.json();
+      expect(okBody).toMatchObject({
+        ok: true,
+        provider: "openai-compatible",
+        protocol: "openai-compatible",
+        model: "mock-model",
+        baseURL: mockBaseURL,
+        reply: "OK",
+      });
+    } finally {
+      await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+    }
   });
 });

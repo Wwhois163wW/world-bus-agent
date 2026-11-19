@@ -32,3 +32,7 @@
 - **修改内容**:
   - `triggerMaidTurn` 向 `maid.consume` 传入 `extensions` 列表。
   - `createAgentRuntime` 暴露 `shutdown()` 等待 `activeTurnDone`, `bootstrap()` 监听 `SIGINT`/`SIGTERM` 清理定时脉冲与 HTTP 服务后安全退出。
+
+### [2026-11-19] @Antigravity, 20261119, [FIX]: 防止 llm.enabled=false 时触发 tick 误清空 Stock
+- **修改原因**: 原 `triggerMaidTurn` 在检查 `!config.llm.enabled` 前先执行了 `stock.splice(0)`, 导致未启用 LLM 时调用 `/tick` 会意外清空 `stock`。
+- **修改内容**: 将 `!config.llm.enabled` 判断前置到 `stock.splice(0)` 之前, 未启用时将新事件安全保留在 `stock` 中。
